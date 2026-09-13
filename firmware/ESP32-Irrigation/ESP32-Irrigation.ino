@@ -54,7 +54,7 @@ extern "C" {
 // ---------- Hardware ----------
 static const char kFirmwareSignature[] __attribute__((used)) =
   "Original author: Beau Kaczmarek - https://github.com/numerik11/ESP32-Irrigation-Controller";
-static const char kFirmwareVersion[] = "3.1";
+static const char kFirmwareVersion[] = "3.1.1";
 static const char kFirmwareBuildDate[] = __DATE__ " " __TIME__;
 static const char kUpdateReportUrl[] =
   "https://irrigation-update-counter.beaukacz86.workers.dev/v1/report";
@@ -399,7 +399,7 @@ int      smartLightRainAdjustPct = -30;
 float    smartForecastRainSkipMm = 5.0f;
 // Basis: 0=current (legacy forecast fallback), 1=forecast max, 2=forecast min/max midpoint.
 int      smartTempBasis = 1;
-int      smartMinimumMin = 5;
+int      smartMinimumMin = 0;
 int      smartMaximumIncreasePct = 100;
 float    smartHysteresisC = 1.0f;
 int      smartSeasonalPct = 100;  // 100% leaves runtimes unchanged
@@ -7974,6 +7974,9 @@ void handleSetupPage() {
     html += String(rulePcts[i]); html += F("'></td></tr>");
   }
   html += F("</tbody></table></div>");
+  html += F("<div class='row'><label>Minimum Adjusted Runtime (minutes)</label><input class='in-sm' type='number' min='0' max='1440' name='smartMinimumMin' value='");
+  html += String(smartMinimumMin);
+  html += F("'><small>Use 0 to apply the full runtime reduction. A minimum of 5 keeps a five-minute schedule at five minutes even when the Global Runtime Factor is lower.</small></div>");
   html += F("<div class='row'><label>Actual Rain Skip Above (mm)</label><input class='in-sm' type='number' step='0.1' min='0' max='200' name='smartActualRainMm' value='");
   html += String(smartActualRainSkipMm, 1); html += F("'><small>Light-rain adjustment up to this amount (%)</small><input class='in-sm' type='number' min='-100' max='300' name='smartLightRainPct' value='");
   html += String(smartLightRainAdjustPct); html += F("'></div>");

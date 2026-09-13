@@ -71,6 +71,8 @@ Review watering and system activity, including weather-related delays, and expor
 
 ## ⏱️ Scheduling and smart watering
 
+Version **3.1.1** exposes **Minimum Adjusted Runtime (minutes)** in Setup. Set it to **0** to apply the full Smart Watering reduction. Existing saved minimums are preserved during upgrades; a five-minute minimum keeps a five-minute schedule unchanged even at an 11% global factor. New configurations default to zero.
+
 Each zone has editable days, two start times, and separate durations. **Sequential mode** runs one valve at a time and suits most systems. **Concurrent mode** can run multiple valves, but only when the transformer, relays, pipework, and water supply can handle the combined load.
 
 With latitude and longitude configured, Open-Meteo can provide temperature, apparent temperature, humidity, wind, pressure, rainfall, daily high/low, sunrise, sunset, and current conditions.

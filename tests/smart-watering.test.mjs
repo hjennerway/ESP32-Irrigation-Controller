@@ -29,6 +29,9 @@ test('temperature boundaries, exclusive Very Hot, and hysteresis transitions',()
 
 test('runtime floor, cap, skips, and disabled schedules',()=>{
   const duration=helpers.smartLimitRuntime;
+  assert.equal(duration(300,0.105,0,100),32);
+  assert.equal(duration(300,0.105,5,100),300);
+  assert.ok(extractFunction(source,'handleSetupPage').includes("name='smartMinimumMin'"));
   assert.equal(duration(1800,1.3,5,100),2340,'30 minutes becomes 39');
   assert.equal(duration(7200,1.3,5,100),9360,'120 minutes becomes 156');
   assert.equal(duration(3600,0.5,5,100),1800);
