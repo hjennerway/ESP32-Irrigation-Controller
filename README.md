@@ -5,7 +5,7 @@
 ![OTA](https://img.shields.io/badge/Updates-OTA-informational)
 ![MQTT](https://img.shields.io/badge/MQTT-Supported-purple)
 
-# 🌱 ESP32 DIY 1–16 Zone Irrigation Controller
+# 🌱 ESP32 Irrigation: 1–16 Zone irrigation control
 
 A flexible, locally controlled irrigation system for **1–16 solenoid valves**. It combines per-zone scheduling, weather-aware delays, optional tank/mains switching, sensor support, MQTT, and a responsive web dashboard.
 
