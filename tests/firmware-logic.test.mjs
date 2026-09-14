@@ -209,8 +209,12 @@ test("ESP32 publishes the Home Assistant discovery contract from its status payl
   assert.match(discovery, /i\s*<\s*\(int\)zonesCount/, "switches follow the configured zone count");
   assert.match(discovery, /cmd\/zone\//, "switch commands use the existing zone command topic");
   assert.match(discovery, /i\s*=\s*\(int\)zonesCount;\s*i\s*<\s*\(int\)MAX_ZONES/, "stale zone discoveries are removed");
-  assert.match(publishConfig, /_mqtt\.publish\(topic\.c_str\(\), payload\.c_str\(\), true\)/, "discovery is retained");
-  assert.match(reconnect, /mqttTryPublishHomeAssistantDiscovery\(now\)/, "discovery runs after MQTT connects");
+  assert.match(publishConfig, /mqttQueuePublish\(topic\.c_str\(\), payload\.c_str\(\), true\)/, "discovery is queued as retained");
+  const queuePublish = extractFunction(esp32, "mqttQueuePublish");
+  const worker = extractFunction(esp32, "mqttWorker");
+  assert.match(queuePublish, /message->retained\s*=\s*retained/, "the queue preserves retention");
+  assert.match(worker, /_mqtt\.publish\(message->topic\.c_str\(\), message->payload\.c_str\(\), message->retained\)/, "the worker publishes with the requested retention");
+  assert.match(reconnect, /if\s*\(mqttConnected\s*&&\s*!mqttConfigPending\)\s*mqttTryPublishHomeAssistantDiscovery\(millis\(\)\)/, "discovery runs after the current MQTT configuration connects");
 });
 
 test("ESP32 browser OTA is authenticated, writes an app image, and restarts only after success", () => {

@@ -288,3 +288,7 @@ If this project helps you, consider giving it a ⭐ on GitHub. Bug reports, test
 Beau
 
 
+
+## Version 3.1.2
+
+Weather, soil-moisture, MQTT and update-report requests now run outside the control loop. Failed weather requests back off, Wi-Fi reconnection no longer waits eight seconds, and event logging uses cached weather. Both ESP32 and ESP32-S3 updater images include these fixes.

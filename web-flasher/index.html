@@ -166,6 +166,8 @@
 <body>
   <main>
     <h1>ESP32 Irrigation Firmware Update</h1>
+    <p>Version 3.1.2 moves weather, MQTT and update-report networking off the control loop, adds weather retry backoff, and removes the Wi-Fi reconnect wait so controls remain responsive during network delays.</p>
+    <p>Version 3.1.2 moves weather, MQTT and update-report networking off the control loop, adds weather retry backoff, and removes the Wi-Fi reconnect wait so controls remain responsive during network delays.</p>
     <p>Version 3.1.1 exposes the Smart Watering minimum runtime and defaults it to zero for new configurations. After upgrading, set Minimum Adjusted Runtime to 0 in Setup to allow the full runtime reduction; saved minimums are preserved.</p>
 
     <label for="board">Board</label>
@@ -191,7 +193,7 @@
       <esp-web-install-button id="installer"></esp-web-install-button>
     </div>
 
-    <p><a id="firmwareDownload" href="esp32-dev/firmware.bin?v=3.1.1-6f1d79cb" download>Download application .bin for Browser OTA</a></p>
+    <p><a id="firmwareDownload" href="esp32-dev/firmware.bin?v=3.1.2-e8bf8487" download>Download application .bin for Browser OTA</a></p>
     <label for="firmwareLink">GitHub URL for Browser OTA</label>
     <input id="firmwareLink" type="url" readonly style="width:100%;padding:10px" aria-label="GitHub firmware URL for selected board">
     <p>Copy this URL into the controller's Browser OTA page, or download the .bin and upload it there.</p>
@@ -205,8 +207,8 @@
   </main>
 
   <script>
-    const updaterVersion = "3.1.1";
-    const updaterBuild = "3.1.1-6f1d79cb";
+    const updaterVersion = "3.1.2";
+    const updaterBuild = "3.1.2-e8bf8487";
     const counterUrl = "https://irrigation-update-counter.beaukacz86.workers.dev";
     const board = document.getElementById("board");
     const installer = document.getElementById("installer");

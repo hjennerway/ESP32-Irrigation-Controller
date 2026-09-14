@@ -17,6 +17,9 @@
   #define ENABLE_TFT 1
 #endif
 #include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
 #include <ArduinoJson.h>
 #include <ArduinoOTA.h>
 #if ENABLE_OTA
@@ -54,7 +57,7 @@ extern "C" {
 // ---------- Hardware ----------
 static const char kFirmwareSignature[] __attribute__((used)) =
   "Original author: Beau Kaczmarek - https://github.com/numerik11/ESP32-Irrigation-Controller";
-static const char kFirmwareVersion[] = "3.1.1";
+static const char kFirmwareVersion[] = "3.1.2";
 static const char kFirmwareBuildDate[] = __DATE__ " " __TIME__;
 static const char kUpdateReportUrl[] =
   "https://irrigation-update-counter.beaukacz86.workers.dev/v1/report";
@@ -608,10 +611,37 @@ void handleDiagnosticsPage();
 void handleDiagnosticsJson();
 void handleTankCalibration();
 static String htmlEscape(const String& s);
-String fetchWeather();
+// One job is owned by either loop() or the worker; queues transfer ownership.
+struct WeatherJob {
+  float lat, lon;
+  String model;
+  uint32_t generation;
+  bool current = false, forecast = false, moisture = false, report = false;
+  int moisturePct = -1, reportCode = 0;
+  String reportPayload;
+  String weatherPayload, forecastPayload, weatherError, forecastError;
+  int weatherCode = 0, forecastCode = 0;
+};
+static WeatherJob weatherJob;
+static QueueHandle_t weatherRequests = nullptr, weatherResults = nullptr;
+static bool weatherBusy = false;
+static uint32_t weatherGeneration = 0;
+struct WeatherRetry {
+  uint32_t completedAt = 0, waitMs = 0;
+  bool ready(uint32_t now) const { return !waitMs || now - completedAt >= waitMs; }
+  void finish(bool success, uint32_t now) {
+    completedAt = now;
+    waitMs = success ? 0 : (waitMs ? min(waitMs * 2, (uint32_t)300000) : 30000);
+  }
+};
+static WeatherRetry currentRetry, forecastRetry;
+static void sendUpdateReport(WeatherJob& job);
+void fetchMeteoMoisture(WeatherJob& job);
+
+String fetchWeather(WeatherJob& job);
 String fetchWeatherHourlyForCurrent(const String& model, float lat, float lon, bool useForecastEndpoint);
 bool buildCurrentFromHourlyPayload(const String& hourlyPayload, String& outPayload);
-String fetchForecast(float lat, float lon);
+String fetchForecast(WeatherJob& job);
 bool checkWindRain();
 void checkI2CHealth();
 void initGpioFallback();
@@ -738,6 +768,9 @@ String mqttPass    = "";
 String mqttBase    = "espirrigation";
 String otaPassword = "";
 
+static bool mqttConnected = false;
+static int mqttState = -1;
+static bool mqttQueuePublish(const char* topic, const char* payload, bool retained);
 WiFiClient   _mqttNetCli;
 PubSubClient _mqtt(_mqttNetCli);
 uint32_t     _lastMqttPub = 0;
@@ -779,11 +812,11 @@ static bool mqttPublishHomeAssistantConfig(const char* component,
   String payload;
   payload.reserve(640);
   serializeJson(d, payload);
-  return _mqtt.publish(topic.c_str(), payload.c_str(), true);
+  return mqttQueuePublish(topic.c_str(), payload.c_str(), true);
 }
 
 static bool mqttPublishHomeAssistantDiscovery() {
-  if (!mqttEnabled || !_mqtt.connected()) return false;
+  if (!mqttEnabled || !mqttConnected) return false;
 
   const String stateTopic = mqttBase + "/status";
   bool allPublished = true;
@@ -849,7 +882,7 @@ static bool mqttPublishHomeAssistantDiscovery() {
   for (int i = (int)zonesCount; i < (int)MAX_ZONES; ++i) {
     const String objectId = "espirrigation_zone_" + String(i + 1);
     const String topic = String(MQTT_DISCOVERY_PREFIX) + "/switch/" + objectId + "/config";
-    if (!_mqtt.publish(topic.c_str(), "", true)) allPublished = false;
+    if (!mqttQueuePublish(topic.c_str(), "", true)) allPublished = false;
   }
 
   Serial.printf("[MQTT] Home Assistant discovery %s (%u zones)\n",
@@ -865,15 +898,126 @@ static void mqttTryPublishHomeAssistantDiscovery(uint32_t now) {
   _mqttDiscoveryPublished = mqttPublishHomeAssistantDiscovery();
 }
 
-void mqttSetup(){
-  _mqttDiscoveryPublished = false;
-  _lastMqttDiscoveryAttempt = 0;
-  if (!mqttEnabled || mqttBroker.length()==0) return;
-  _mqtt.setServer(mqttBroker.c_str(), mqttPort);
+// The MQTT task exclusively owns the client and socket. Controller commands
+// cross a queue and execute on loop(), never on the network task.
+struct MqttMessage {
+  bool configure = false, enabled = false, retained = false;
+  uint32_t generation = 0;
+  uint16_t port = 1883;
+  String host, user, pass, base, clientId, topic, payload;
+};
+struct MqttCommand {
+  uint32_t generation;
+  char topic[256];
+  byte payload[256];
+  unsigned int length;
+};
+struct MqttSnapshot {
+  bool connected;
+  int state;
+  uint32_t generation, retryMs, connectionId;
+  uint8_t failures;
+};
+static QueueHandle_t mqttRequests = nullptr, mqttCommands = nullptr, mqttSnapshots = nullptr;
+static uint32_t mqttGeneration = 0;
+static bool mqttConfigPending = false;
+
+static void mqttWorker(void*) {
+  MqttMessage config;
+  uint32_t connectionId = 0;
+  uint32_t nextAttempt = 0, retryMs = MQTT_RECONNECT_DELAY_MIN_MS;
+  uint8_t failures = 0;
   _mqtt.setBufferSize(2048);
   _mqtt.setKeepAlive(30);
   _mqtt.setSocketTimeout(1);
-  _mqtt.setCallback([](char* topic, byte* payload, unsigned int len){
+  _mqtt.setCallback([&](char* topic, byte* payload, unsigned int length) {
+    MqttCommand cmd{};
+    if (strlen(topic) >= sizeof(cmd.topic) || length >= sizeof(cmd.payload)) return;
+    cmd.generation = config.generation;
+    strcpy(cmd.topic, topic);
+    memcpy(cmd.payload, payload, length);
+    cmd.length = length;
+    xQueueSend(mqttCommands, &cmd, 0);
+  });
+  for (;;) {
+    MqttMessage* message = nullptr;
+    // Bound each batch so incoming commands and reconnects keep progressing.
+    for (int i = 0; i < 8 && xQueueReceive(mqttRequests, &message, 0) == pdTRUE; ++i) {
+      if (message->configure) {
+        _mqtt.disconnect();
+        config = *message;
+        _mqtt.setServer(config.host.c_str(), config.port);
+        failures = 0;
+        retryMs = MQTT_RECONNECT_DELAY_MIN_MS;
+        nextAttempt = millis();
+      } else if (message->generation == config.generation && _mqtt.connected()) {
+        if (!_mqtt.publish(message->topic.c_str(), message->payload.c_str(), message->retained)) _mqtt.disconnect();
+      }
+      delete message;
+    }
+    if (config.enabled && WiFi.status() == WL_CONNECTED) {
+      if (!_mqtt.connected() && (int32_t)(millis() - nextAttempt) >= 0) {
+        bool ok = config.user.length()
+          ? _mqtt.connect(config.clientId.c_str(), config.user.c_str(), config.pass.c_str())
+          : _mqtt.connect(config.clientId.c_str());
+        if (ok) {
+          ++connectionId;
+          failures = 0;
+          retryMs = MQTT_RECONNECT_DELAY_MIN_MS;
+          _mqtt.subscribe((config.base + "/cmd/#").c_str());
+        } else {
+          if (failures < 8) ++failures;
+          retryMs = min(retryMs * 2, MQTT_RECONNECT_DELAY_MAX_MS);
+        }
+        nextAttempt = millis() + retryMs;
+      }
+      _mqtt.loop();
+    } else if (_mqtt.connected()) {
+      _mqtt.disconnect();
+    }
+    MqttSnapshot snapshot{_mqtt.connected(), _mqtt.state(), config.generation, retryMs, connectionId, failures};
+    xQueueOverwrite(mqttSnapshots, &snapshot);
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+}
+
+static bool startMqttWorker() {
+  if (mqttRequests) return true;
+  mqttRequests = xQueueCreate(32, sizeof(MqttMessage*));
+  mqttCommands = xQueueCreate(8, sizeof(MqttCommand));
+  mqttSnapshots = xQueueCreate(1, sizeof(MqttSnapshot));
+  if (mqttRequests && mqttCommands && mqttSnapshots &&
+      xTaskCreate(mqttWorker, "mqtt", 6144, nullptr, 1, nullptr) == pdPASS) return true;
+  if (mqttRequests) vQueueDelete(mqttRequests);
+  if (mqttCommands) vQueueDelete(mqttCommands);
+  if (mqttSnapshots) vQueueDelete(mqttSnapshots);
+  mqttRequests = mqttCommands = mqttSnapshots = nullptr;
+  return false;
+}
+
+static bool mqttQueuePublish(const char* topic, const char* payload, bool retained) {
+  if (!mqttConnected || mqttConfigPending || !mqttRequests) return false;
+  if (strlen(topic) + strlen(payload) + 7 > 2048) return false;
+  MqttMessage* message = new (std::nothrow) MqttMessage;
+  if (!message) return false;
+  message->generation = mqttGeneration;
+  message->topic = topic;
+  message->payload = payload;
+  message->retained = retained;
+  if (xQueueSend(mqttRequests, &message, 0) == pdTRUE) return true;
+  delete message;
+  return false;
+}
+
+void mqttSetup() {
+  ++mqttGeneration;
+  mqttConnected = false;
+  mqttConfigPending = true;
+  _mqttDiscoveryPublished = false;
+  _lastMqttDiscoveryAttempt = 0;
+}
+
+static void mqttApplyCommand(char* topic, byte* payload, unsigned int len) {
     String t(topic), msg; msg.reserve(len);
     for (unsigned i=0;i<len;i++) msg += (char)payload[i];
 
@@ -894,52 +1038,54 @@ void mqttSetup(){
         else                                turnOffValveManual(z);
       }
     }
-  });
 }
-void mqttEnsureConnected(){
-  if (!mqttEnabled || mqttBroker.length()==0) return;
-  if (WiFi.status() != WL_CONNECTED) return;
-  const uint32_t now = millis();
-  if (_mqtt.connected()) {
-    _mqttReconnectFailures = 0;
-    _mqttReconnectDelayMs = MQTT_RECONNECT_DELAY_MIN_MS;
-    mqttTryPublishHomeAssistantDiscovery(now);
-    return;
-  }
-  if (now - _lastMqttAttempt < _mqttReconnectDelayMs) return;
-  _lastMqttAttempt = now;
-  String cid = "espirrigation-" + WiFi.macAddress();
-  bool ok = false;
-  if (mqttUser.length()) {
-    ok = _mqtt.connect(cid.c_str(), mqttUser.c_str(), mqttPass.c_str());
-  } else {
-    ok = _mqtt.connect(cid.c_str());
-  }
-  if (ok) {
-    _mqttReconnectFailures = 0;
-    _mqttReconnectDelayMs = MQTT_RECONNECT_DELAY_MIN_MS;
-    _mqtt.subscribe( (mqttBase + "/cmd/#").c_str() );
-    _mqttDiscoveryPublished = false;
-    _lastMqttDiscoveryAttempt = 0;
-    mqttTryPublishHomeAssistantDiscovery(now);
-  } else {
-    if (_mqttReconnectFailures < 8) _mqttReconnectFailures++;
-    uint32_t nextDelay = MQTT_RECONNECT_DELAY_MIN_MS;
-    for (uint8_t i = 0; i < _mqttReconnectFailures; ++i) {
-      if (nextDelay >= MQTT_RECONNECT_DELAY_MAX_MS / 2) {
-        nextDelay = MQTT_RECONNECT_DELAY_MAX_MS;
-        break;
-      }
-      nextDelay *= 2;
+
+void mqttEnsureConnected() {
+  if (mqttConfigPending) {
+    if (!mqttEnabled && !mqttRequests) { mqttConfigPending = false; return; }
+    static uint32_t lastAllocationAttempt = 0;
+    if (!mqttRequests) {
+      if (lastAllocationAttempt && millis() - lastAllocationAttempt < 30000UL) return;
+      lastAllocationAttempt = millis();
+      if (!startMqttWorker()) return;
     }
-    _mqttReconnectDelayMs = nextDelay;
-    Serial.printf("[MQTT] connect failed, rc=%d; retry in %lus\n",
-                  _mqtt.state(), (unsigned long)(_mqttReconnectDelayMs / 1000UL));
+    MqttMessage* config = new (std::nothrow) MqttMessage;
+    if (!config) return;
+    config->configure = true;
+    config->enabled = mqttEnabled && mqttBroker.length() > 0;
+    config->generation = mqttGeneration;
+    config->host = mqttBroker;
+    config->port = mqttPort;
+    config->user = mqttUser;
+    config->pass = mqttPass;
+    config->base = mqttBase;
+    config->clientId = "espirrigation-" + WiFi.macAddress();
+    if (xQueueSend(mqttRequests, &config, 0) == pdTRUE) mqttConfigPending = false;
+    else delete config;
   }
+  if (!mqttRequests) return;
+  MqttSnapshot snapshot;
+  static uint32_t lastConnectionId = 0;
+  if (xQueueReceive(mqttSnapshots, &snapshot, 0) == pdTRUE && snapshot.generation == mqttGeneration) {
+    if (snapshot.connected && (!mqttConnected || snapshot.connectionId != lastConnectionId)) {
+      _mqttDiscoveryPublished = false;
+      _lastMqttDiscoveryAttempt = 0;
+    }
+    mqttConnected = snapshot.connected;
+    lastConnectionId = snapshot.connectionId;
+    mqttState = snapshot.state;
+    _mqttReconnectDelayMs = snapshot.retryMs;
+    _mqttReconnectFailures = snapshot.failures;
+  }
+  MqttCommand cmd;
+  for (int i = 0; i < 8 && xQueueReceive(mqttCommands, &cmd, 0) == pdTRUE; ++i) {
+    if (mqttEnabled && cmd.generation == mqttGeneration) mqttApplyCommand(cmd.topic, cmd.payload, cmd.length);
+  }
+  if (mqttConnected && !mqttConfigPending) mqttTryPublishHomeAssistantDiscovery(millis());
 }
 
 void mqttPublishStatus(){
-  if (!mqttEnabled || !_mqtt.connected()) return;
+  if (!mqttEnabled || !mqttConnected) return;
   if (millis() - _lastMqttPub < 3000) return;
   _lastMqttPub = millis();
 
@@ -971,7 +1117,7 @@ void mqttPublishStatus(){
   String out;
   out.reserve(900);
   serializeJson(d, out);
-  _mqtt.publish( (mqttBase + "/status").c_str(), out.c_str(), true);
+  mqttQueuePublish( (mqttBase + "/status").c_str(), out.c_str(), true);
 }
 
 static inline int i_min(int a, int b) { return (a < b) ? a : b; }
@@ -1272,6 +1418,8 @@ static String httpGetMeteo(const String& url, int& code, uint16_t timeoutMs) {
   WiFiClientSecure secure;   // <-- This one should be created first
   HTTPClient http;           // <-- This one second
   secure.setInsecure();
+  secure.setHandshakeTimeout(5);
+  http.setConnectTimeout(3000);
   http.setTimeout(timeoutMs);
   http.begin(secure, url);
   code = http.GET();
@@ -2605,11 +2753,11 @@ void handleDiagnosticsJson() {
 
   JsonObject mqtt = doc["mqtt"].to<JsonObject>();
   mqtt["enabled"] = mqttEnabled;
-  mqtt["connected"] = _mqtt.connected();
+  mqtt["connected"] = mqttConnected;
   mqtt["broker"] = mqttBroker;
   mqtt["port"] = mqttPort;
   mqtt["baseTopic"] = mqttBase;
-  mqtt["lastState"] = _mqtt.state();
+  mqtt["lastState"] = mqttState;
   mqtt["reconnectDelaySec"] = _mqttReconnectDelayMs / 1000UL;
   mqtt["reconnectFailures"] = _mqttReconnectFailures;
 
@@ -2821,8 +2969,8 @@ void handleDiagnosticsPage() {
   html += F("<tr><td>SSID</td><td>"); html += WiFi.SSID(); html += F("</td></tr>");
   html += F("<tr><td>Hostname</td><td>"); html += WiFi.getHostname(); html += F("</td></tr>");
   html += F("<tr><td>WiFi signal</td><td id='diagNetworkWifi'>"); html += String(rssi); html += F(" dBm - "); html += rssiLabel; html += F("</td></tr>");
-  html += F("<tr><td>MQTT</td><td class='"); html += (_mqtt.connected() ? "ok" : (mqttEnabled ? "warn" : "")); html += F("'>");
-  html += (mqttEnabled ? (_mqtt.connected() ? "connected" : "offline") : "disabled"); html += F("</td></tr>");
+  html += F("<tr><td>MQTT</td><td class='"); html += (mqttConnected ? "ok" : (mqttEnabled ? "warn" : "")); html += F("'>");
+  html += (mqttEnabled ? (mqttConnected ? "connected" : "offline") : "disabled"); html += F("</td></tr>");
   html += F("<tr><td>Base topic</td><td>"); html += mqttBase; html += F("</td></tr>");
   html += F("</table></div>");
 
@@ -3694,14 +3842,18 @@ void loop() {
     now = millis();
   }
 
+  static bool wifiWasConnected = false;
+  const bool wifiConnected = WiFi.status() == WL_CONNECTED;
+  if (wifiConnected && !wifiWasConnected) configureWifiForHttp();
+  wifiWasConnected = wifiConnected;
+
   tickUpdateReport();
 
   enforceNoWaterPeriod();
   checkWindRain();
   mqttEnsureConnected();
-  if (mqttEnabled) _mqtt.loop();
   mqttPublishStatus(); 
-  tickWeather(); // Timed weather fetch after servicing HTTP to avoid blocking the UI
+  tickWeather(); // Queue networking and consume completed results without waiting
   tickManualButtons();
   tickAutoBacklight();
 
@@ -3881,23 +4033,11 @@ void wifiCheck() {
     WiFi.disconnect(false, false);   // do NOT clear saved credentials
     WiFi.reconnect();
 
-    // wait up to ~8s for reconnect using stored creds (no portal)
-    unsigned long t0 = millis();
-    while (WiFi.status()!=WL_CONNECTED && (millis() - t0) < 8000UL) {
-      delay(250);
-    }
-
-    if (WiFi.status()==WL_CONNECTED) {
-      Serial.println("Reconnected.");
-      configureWifiForHttp();
-    } else {
-      Serial.println("Reconnection failed (kept creds, not opening portal).");
-    }
+    // The Wi-Fi stack reconnects asynchronously; keep servicing controls.
   }
 }
 
 void checkI2CHealth() {
-  delay(20);
   bool anyErr=false;
   for (uint8_t addr : expanderAddrs) {
     I2Cbus.beginTransmission(addr);
@@ -4213,16 +4353,9 @@ int meteoSoilPercent(float fraction) {
 
 // Use automatic model selection independently of the weather model: not all
 // weather models provide the 0-1 cm layer. The first hour is the current hour.
-void updateMeteoMoisture() {
-  if (!moistureProbeEnabled || !moistureUseMeteo) return;
-  const unsigned long nowMs = millis();
-  if (meteoMoistureAttempted && nowMs - meteoMoistureAttemptMs < 15UL * 60UL * 1000UL) return;
-  meteoMoistureAttempted = true;
-  meteoMoistureAttemptMs = nowMs;
-  meteoMoisturePct = -1;
-  if (!isValidLatLon(meteoLat, meteoLon)) return;
-  String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(meteoLat, 6) +
-    "&longitude=" + String(meteoLon, 6) +
+void fetchMeteoMoisture(WeatherJob& job) {
+  String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(job.lat, 6) +
+    "&longitude=" + String(job.lon, 6) +
     "&hourly=soil_moisture_0_to_1cm&forecast_hours=1&timeformat=unixtime&timezone=GMT";
   int code = 0;
   String payload = httpGetMeteo(url, code, meteoHttpTimeoutMs());
@@ -4232,19 +4365,18 @@ void updateMeteoMoisture() {
   JsonVariant value = data["hourly"]["soil_moisture_0_to_1cm"][0];
   if (!value.is<float>()) return;
   const float fraction = value.as<float>();
-  meteoMoisturePct = meteoSoilPercent(fraction);
-  meteoMoistureFetchedMs = millis();
+  job.moisturePct = meteoSoilPercent(fraction);
 }
 
-String fetchWeather() {
-  if (!isValidLatLon(meteoLat, meteoLon)) return "";
-  String model = cleanMeteoModel(meteoModel);
-  lastWeatherError = "";
-  lastWeatherHttpCode = 0;
+String fetchWeather(WeatherJob& job) {
+  if (!isValidLatLon(job.lat, job.lon)) return "";
+  String model = cleanMeteoModel(job.model);
+  job.weatherError = "";
+  job.weatherCode = 0;
 
   auto buildUrl = [&](bool useSelectedModel) -> String {
     String url = meteoBaseUrl(model, useSelectedModel);
-    url += "?latitude=" + String(meteoLat,6) + "&longitude=" + String(meteoLon,6);
+    url += "?latitude=" + String(job.lat,6) + "&longitude=" + String(job.lon,6);
     url += "&current=temperature_2m,relative_humidity_2m,apparent_temperature,pressure_msl,surface_pressure,"
            "wind_speed_10m,wind_gusts_10m,wind_direction_10m,precipitation,weather_code";
     if (useSelectedModel && model != "best_match") url += "&models=" + model;
@@ -4257,26 +4389,26 @@ String fetchWeather() {
     String url = buildUrl(useSelectedModel);
     int code = 0;
     String payload = httpGetMeteo(url, code, meteoHttpTimeoutMs());
-    lastWeatherHttpCode = code;
+    job.weatherCode = code;
 
     if (code == 200 && payload.length() && !isMeteoErrorPayload(payload)) {
       if (payload.indexOf("\"current\"") != -1) return payload;
-      lastWeatherError = "No current in response";
+      job.weatherError = "No current in response";
     } else {
       String reason = meteoErrorReason(payload);
-      if (reason.length()) lastWeatherError = reason;
-      else if (code != 200) lastWeatherError = "HTTP " + String(code);
-      else lastWeatherError = "Empty payload";
+      if (reason.length()) job.weatherError = reason;
+      else if (code != 200) job.weatherError = "HTTP " + String(code);
+      else job.weatherError = "Empty payload";
     }
   }
 
   // Fallback: derive current from hourly
-  String hourlyPayload = fetchWeatherHourlyForCurrent(model, meteoLat, meteoLon, true);
+  String hourlyPayload = fetchWeatherHourlyForCurrent(model, job.lat, job.lon, true);
   if (hourlyPayload.length()) {
     String out;
     if (buildCurrentFromHourlyPayload(hourlyPayload, out)) return out;
   }
-  String hourlyPayloadForecast = fetchWeatherHourlyForCurrent(model, meteoLat, meteoLon, false);
+  String hourlyPayloadForecast = fetchWeatherHourlyForCurrent(model, job.lat, job.lon, false);
   if (hourlyPayloadForecast.length()) {
     String out;
     if (buildCurrentFromHourlyPayload(hourlyPayloadForecast, out)) return out;
@@ -4348,11 +4480,12 @@ bool buildCurrentFromHourlyPayload(const String& hourlyPayload, String& outPaylo
   return outPayload.length() > 0;
 }
 
-String fetchForecast(float lat, float lon) {
+String fetchForecast(WeatherJob& job) {
+  const float lat = job.lat, lon = job.lon;
   if (!isValidLatLon(lat, lon)) return "";
-  String model = cleanMeteoModel(meteoModel);
-  lastForecastError = "";
-  lastForecastHttpCode = 0;
+  String model = cleanMeteoModel(job.model);
+  job.forecastError = "";
+  job.forecastCode = 0;
 
   auto buildUrl = [&](bool useSelectedModel) -> String {
     String url = meteoBaseUrl(model, useSelectedModel);
@@ -4370,16 +4503,42 @@ String fetchForecast(float lat, float lon) {
     String url = buildUrl(useSelectedModel);
     int code = 0;
     String payload = httpGetMeteo(url, code, meteoHttpTimeoutMs());
-    lastForecastHttpCode = code;
+    job.forecastCode = code;
     if (code == 200 && payload.length() && !isMeteoErrorPayload(payload)) {
       return payload;
     }
     String reason = meteoErrorReason(payload);
-    if (reason.length()) lastForecastError = reason;
-    else if (code != 200) lastForecastError = "HTTP " + String(code);
-    else lastForecastError = "Empty payload";
+    if (reason.length()) job.forecastError = reason;
+    else if (code != 200) job.forecastError = "HTTP " + String(code);
+    else job.forecastError = "Empty payload";
   }
   return "";
+}
+
+// Network calls run only here. No UI, valve, cache, or configuration writes.
+static void weatherWorker(void*) {
+  uint8_t token;
+  for (;;) {
+    if (xQueueReceive(weatherRequests, &token, portMAX_DELAY) != pdTRUE) continue;
+    if (weatherJob.report) sendUpdateReport(weatherJob);
+    if (weatherJob.moisture) fetchMeteoMoisture(weatherJob);
+    if (weatherJob.current) weatherJob.weatherPayload = fetchWeather(weatherJob);
+    if (weatherJob.forecast) weatherJob.forecastPayload = fetchForecast(weatherJob);
+    xQueueSend(weatherResults, &token, portMAX_DELAY);
+  }
+}
+
+static bool startWeatherWorker() {
+  if (weatherRequests) return true;
+  weatherRequests = xQueueCreate(1, sizeof(uint8_t));
+  weatherResults = xQueueCreate(1, sizeof(uint8_t));
+  if (weatherRequests && weatherResults &&
+      xTaskCreate(weatherWorker, "weather", 12288, nullptr, 1, nullptr) == pdPASS) return true;
+  if (weatherRequests) vQueueDelete(weatherRequests);
+  if (weatherResults) vQueueDelete(weatherResults);
+  weatherRequests = weatherResults = nullptr;
+  Serial.println("[Weather] worker allocation failed; retry later");
+  return false;
 }
 
 // ---------- NEW helpers for rain history ----------
@@ -4571,20 +4730,35 @@ void updateCachedWeather() {
   // up the local UI and avoids early heap-heavy TLS work after WiFiManager.
   if (!g_configLoadedFromFs) return;
 
-  updateMeteoMoisture();
+  if (weatherBusy && weatherJob.report) return;
 
   unsigned long nowms = millis();
-  bool needCur = (cachedWeatherData == "" ||
-                  (nowms - lastWeatherUpdate >= weatherUpdateInterval));
-  bool haveCoord = isValidLatLon(meteoLat, meteoLon);
   bool weatherChanged = false;
-
-  if (needCur) {
-    String fresh = fetchWeather();
-    if (fresh.length() > 0) {
-      weatherChanged = (fresh != cachedWeatherData);
-      cachedWeatherData = fresh;
-      lastWeatherUpdate = nowms;
+  bool completed = false;
+  uint8_t token = 1;
+  if (weatherBusy && xQueueReceive(weatherResults, &token, 0) == pdTRUE) {
+    weatherBusy = false;
+    completed = weatherJob.generation == weatherGeneration;
+    if (completed && weatherJob.moisture && moistureProbeEnabled && moistureUseMeteo) {
+      meteoMoisturePct = weatherJob.moisturePct;
+      if (meteoMoisturePct >= 0) meteoMoistureFetchedMs = nowms;
+    }
+    if (completed && weatherJob.current) {
+      const bool success = weatherJob.weatherPayload.length() > 0;
+      currentRetry.finish(success, nowms);
+      lastWeatherHttpCode = weatherJob.weatherCode;
+      lastWeatherError = success ? "" : weatherJob.weatherError;
+      if (success) {
+        weatherChanged = weatherJob.weatherPayload != cachedWeatherData;
+        cachedWeatherData = weatherJob.weatherPayload;
+        lastWeatherUpdate = nowms;
+      }
+    }
+    if (completed && weatherJob.forecast) {
+      const bool success = weatherJob.forecastPayload.length() > 0;
+      forecastRetry.finish(success, nowms);
+      lastForecastHttpCode = weatherJob.forecastCode;
+      lastForecastError = success ? "" : weatherJob.forecastError;
     }
   }
 
@@ -4597,8 +4771,8 @@ void updateCachedWeather() {
   applyLocalClimateOverride();
 
   // ---- Forecast fetch / parse ----
-  if (haveCoord && (cachedForecastData == "" || (nowms - lastForecastUpdate >= forecastUpdateInterval))) {
-    String freshFc = fetchForecast(meteoLat, meteoLon);
+  if (completed && weatherJob.forecast) {
+    String& freshFc = weatherJob.forecastPayload;
     if (freshFc.length() > 0) {
       cachedForecastData = freshFc;
       lastForecastUpdate = nowms;
@@ -4655,6 +4829,35 @@ void updateCachedWeather() {
     }
   }
 
+  // Apply results before transferring the job back to the network task.
+  if (!weatherBusy && WiFi.status() == WL_CONNECTED && isValidLatLon(meteoLat, meteoLon)) {
+    const bool needCur = (cachedWeatherData == "" || nowms - lastWeatherUpdate >= weatherUpdateInterval) && currentRetry.ready(nowms);
+    const bool needFc = (cachedForecastData == "" || nowms - lastForecastUpdate >= forecastUpdateInterval) && forecastRetry.ready(nowms);
+    const bool needMoisture = moistureProbeEnabled && moistureUseMeteo &&
+      (!meteoMoistureAttempted || nowms - meteoMoistureAttemptMs >= 15UL * 60UL * 1000UL);
+    if (needCur || needFc || needMoisture) {
+      if (startWeatherWorker()) {
+        weatherJob = WeatherJob{};
+        weatherJob.lat = meteoLat;
+        weatherJob.lon = meteoLon;
+        weatherJob.model = meteoModel;
+        weatherJob.generation = weatherGeneration;
+        weatherJob.current = needCur;
+        weatherJob.forecast = needFc;
+        weatherJob.moisture = needMoisture;
+        weatherBusy = xQueueSend(weatherRequests, &token, 0) == pdTRUE;
+        if (weatherBusy && needMoisture) {
+          meteoMoistureAttempted = true;
+          meteoMoistureAttemptMs = nowms;
+        }
+      }
+      if (!weatherBusy) {
+        if (needCur) currentRetry.finish(false, nowms);
+        if (needFc) forecastRetry.finish(false, nowms);
+      }
+    }
+  }
+
   // Fallback min/max from current weather snapshot
   if (isfinite(curTempC)) {
     if (!isfinite(todayMin_C) || curTempC < todayMin_C) todayMin_C = curTempC;
@@ -4671,7 +4874,8 @@ void tickWeather(){
   uint32_t nowMs = millis();
   const uint32_t WEATHER_TICK_MS = 10000UL; // every 10s is plenty
 
-  if (nowMs - lastTick < WEATHER_TICK_MS) {
+  const bool resultReady = weatherBusy && uxQueueMessagesWaiting(weatherResults) > 0;
+  if (!resultReady && nowMs - lastTick < WEATHER_TICK_MS) {
     return;
   }
   lastTick = nowMs;
@@ -4815,7 +5019,7 @@ void logEvent(int zone, const char* eventType, const char* source, bool rainDela
     else totalScheduledRuntimeSec += dur;
   }
 
-  updateCachedWeather(); // safe early-out if g_inHttp==true, keeps details recent enough
+  // Event logging uses cached weather; never starts a network request.
   float temp = curTempC;
   float wind = curWindMs;
   int hum = (curHumidityPct >= 0) ? curHumidityPct : 0;
@@ -5396,7 +5600,7 @@ void RainScreen(){
   }
 
   int rssi = WiFi.RSSI();
-  bool mqttOk = _mqtt.connected();
+  bool mqttOk = mqttConnected;
   bool rssiChanged = (abs(rssi - lastRssi) >= 4);
   if (layoutChanged || rssiChanged || mqttOk != lastMqtt) {
     int x = pad + 6;
@@ -5513,7 +5717,7 @@ void HomeScreen() {
     display.print(" Q ");
     display.print(queued);
     display.print(" MQTT ");
-    display.print(_mqtt.connected() ? "up" : "down");
+    display.print(mqttConnected ? "up" : "down");
 
     display.display();
     return;
@@ -6558,8 +6762,7 @@ void handleRoot() {
     snprintf(heroDateStr, sizeof(heroDateStr), "Date unavailable");
   }
 
-  // Keep this - it respects the g_inHttp guard
-  updateCachedWeather();
+  // Page rendering uses the last completed weather snapshot.
 
   // Safe reads from decoded snapshot
   float temp = temperatureForDisplay(curTempC);
@@ -10286,6 +10489,9 @@ void handleConfigure() {
     cachedForecastData  = "";
     lastWeatherUpdate   = 0;
     lastForecastUpdate  = 0;
+    ++weatherGeneration; // Discard in-flight results from previous settings.
+    currentRetry = WeatherRetry{};
+    forecastRetry = WeatherRetry{};
 
     // Reset derived metrics so /status & UI show clean values until next fetch
     rain1hNow           = 0.0f;
@@ -10422,12 +10628,41 @@ static void initUpdateReportState() {
   updateReportNextAttemptMs = millis() + UPDATE_REPORT_BOOT_DELAY_MS;
 }
 
+static void sendUpdateReport(WeatherJob& job) {
+  WiFiClientSecure secure;
+  secure.setInsecure();
+  secure.setHandshakeTimeout(5);
+  HTTPClient http;
+  http.setConnectTimeout(5000);
+  http.setTimeout(5000);
+  if (!http.begin(secure, kUpdateReportUrl)) { job.reportCode = -1; return; }
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("User-Agent", String("ESP32-Irrigation/") + kFirmwareVersion);
+  job.reportCode = http.POST(job.reportPayload);
+  http.end();
+
+}
+
 static void tickUpdateReport() {
-  if (!updateReportPending || WiFi.status() != WL_CONNECTED) return;
   const uint32_t now = millis();
+  if (weatherBusy && weatherJob.report) {
+    uint8_t token;
+    if (xQueueReceive(weatherResults, &token, 0) != pdTRUE) return;
+    weatherBusy = false;
+    const int code = weatherJob.reportCode;
+    updateReportNextAttemptMs = now + UPDATE_REPORT_RETRY_MS;
+    if (code >= 200 && code < 300) {
+      updateReportPending = false;
+      saveUpdateReportState(true);
+      Serial.printf("[UPDATE] Firmware %s success reported\n", kFirmwareVersion);
+    } else {
+      Serial.printf("[UPDATE] Success report retry scheduled (HTTP %d)\n", code);
+    }
+  }
+  if (!updateReportPending || weatherBusy || WiFi.status() != WL_CONNECTED) return;
   if ((int32_t)(now - updateReportNextAttemptMs) < 0) return;
   updateReportNextAttemptMs = now + UPDATE_REPORT_RETRY_MS;
-
+  if (!startWeatherWorker()) return;
   JsonDocument doc;
   doc["version"] = kFirmwareVersion;
   #if defined(CONFIG_IDF_TARGET_ESP32S3)
@@ -10439,22 +10674,10 @@ static void tickUpdateReport() {
   String payload;
   serializeJson(doc, payload);
 
-  WiFiClientSecure secure;
-  secure.setInsecure();
-  HTTPClient http;
-  http.setConnectTimeout(5000);
-  http.setTimeout(5000);
-  if (!http.begin(secure, kUpdateReportUrl)) return;
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("User-Agent", String("ESP32-Irrigation/") + kFirmwareVersion);
-  const int code = http.POST(payload);
-  http.end();
 
-  if (code >= 200 && code < 300) {
-    updateReportPending = false;
-    saveUpdateReportState(true);
-    Serial.printf("[UPDATE] Firmware %s success reported\n", kFirmwareVersion);
-  } else {
-    Serial.printf("[UPDATE] Success report retry scheduled (HTTP %d)\n", code);
-  }
+  weatherJob = WeatherJob{};
+  weatherJob.report = true;
+  weatherJob.reportPayload = payload;
+  uint8_t token = 1;
+  weatherBusy = xQueueSend(weatherRequests, &token, 0) == pdTRUE;
 }
