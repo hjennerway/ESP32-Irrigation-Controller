@@ -302,3 +302,7 @@ The Events page now streams HTML in small chunks to reduce memory pressure. It s
 Setup uses smaller HTML chunks and the current in-memory settings. Saving no longer waits for NTP or forces sensor reads; timezone synchronisation restarts only when its settings change. Status polling shares requests, times out stalled requests, and pauses during navigation. Saves that require a restart show a confirmation page before reopening Setup.
 
 The main loop checks valve expiry and watering restrictions before HTTP work and again around background work. Valve transitions request a screen redraw instead of pausing for OLED messages. The loop refreshes its timestamp after web requests and yields for 5 ms between passes.
+
+## Version 3.2
+
+The Current Weather summary shows Forecasted Rain between Condition and Wind Direction. It displays the next 24 hours of predicted rainfall in millimetres, updates with live status, and shows -- until a forecast is available.

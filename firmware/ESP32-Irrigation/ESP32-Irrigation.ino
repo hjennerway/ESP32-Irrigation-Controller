@@ -57,7 +57,7 @@ extern "C" {
 // ---------- Hardware ----------
 static const char kFirmwareSignature[] __attribute__((used)) =
   "Original author: Beau Kaczmarek - https://github.com/numerik11/ESP32-Irrigation-Controller";
-static const char kFirmwareVersion[] = "3.1.4";
+static const char kFirmwareVersion[] = "3.2";
 static const char kFirmwareBuildDate[] = __DATE__ " " __TIME__;
 static const char kUpdateReportUrl[] =
   "https://irrigation-update-counter.beaukacz86.workers.dev/v1/report";
@@ -3441,6 +3441,8 @@ void setup() {
     // Forecast fields
     doc["rain12h"]     = isnan(rainNext12h_mm) ? 0.0f : rainNext12h_mm;
     doc["rain24h"]     = isnan(rainNext24h_mm) ? 0.0f : rainNext24h_mm;
+    if (lastForecastUpdate && isfinite(rainNext24h_mm)) doc["forecastRain24h"] = rainNext24h_mm;
+    else doc["forecastRain24h"] = nullptr;
     doc["pop12h"]      = (popNext12h_pct < 0 ? 0 : popNext12h_pct);
     doc["nextRainInH"] = (nextRainIn_h < 0 ? 255 : nextRainIn_h);
     doc["gust24h"]     = isnan(maxGust24h_ms) ? 0.0f : maxGust24h_ms;
@@ -7176,6 +7178,7 @@ void handleRoot() {
   // rule expanded every small reading into a full-width row.
   html += F("@media(max-width:480px){.weather-card{gap:10px}.weather-card .summary-metric-grid,.weather-card .summary-metric-grid.metric-pair{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.weather-card .metric-tile{min-height:70px;padding:9px 10px;gap:6px}.weather-card .metric-k{font-size:.66rem;letter-spacing:.09em}.weather-card .metric-v{font-size:.96rem}.weather-card .metric-v.big-metric{font-size:1.2rem}.weather-card .condition-tile,.weather-card .wind-dir-tile{min-height:86px}.weather-card .condition-wrap,.weather-card .wind-compass-wrap{align-items:center;gap:7px}.weather-card .wind-compass{width:52px;height:52px;flex-basis:52px}.weather-card .wind-needle{height:18px}.weather-card .summary-subhead{margin-top:0}}");
   html += F("@media(max-width:360px){.weather-card .summary-metric-grid.metric-pair{grid-template-columns:1fr}.weather-card .condition-tile,.weather-card .wind-dir-tile{min-height:76px}}");
+  html += F(".weather-card .summary-metric-grid.weather-outlook{grid-template-columns:repeat(3,minmax(0,1fr))}.forecast-rain-tile{justify-content:center}@media(max-width:640px){.weather-card .summary-metric-grid.weather-outlook{grid-template-columns:1fr}}");
   // Keep schedule editing dense enough for a phone without shrinking tap targets.
   // Time, duration and weekday controls stay horizontal instead of becoming rows.
   html += F("@media(max-width:480px){.sched-body{padding:8px}.sched-grid{gap:8px}.sched-card{padding:10px}.sched-card h4{margin-bottom:7px}.sched-card .rowx{margin:7px 0}.sched-card .rowx>label{margin-bottom:2px;font-size:.72rem}.sched-card .in{padding:8px 9px}.sched-card .time-spin{width:auto;max-width:100%;grid-template-columns:auto 6px auto auto;gap:5px;padding:6px}.sched-card .time-part{grid-template-columns:auto 32px}.sched-card .time-val{width:54px}.sched-card .time-arrow{width:32px}.sched-card .time-ampm{grid-column:auto;width:54px}.sched-card .duration-spin{grid-template-columns:auto auto auto auto}.sched-card .duration-spin .time-val{width:58px}.sched-card .duration-unit{margin-right:2px;font-size:.7rem}.sched-card .days-grid{grid-template-columns:repeat(4,minmax(0,1fr));gap:6px}.sched-card .day span{min-height:40px;padding:8px 5px;font-size:.7rem}.sched-card .toolbar{margin-top:9px}.sched-card .toolbar .btn{min-height:40px;padding:9px 12px}}");
@@ -7255,10 +7258,13 @@ void handleRoot() {
   html += F("<div class='metric-tile'><span class='metric-k'>Wind</span><div class='metric-v' id='windChip'>");
   html += (isnan(ws) ? String("--") : String(ws,1)+" m/s");
   html += F("</div></div>");
-  html += F("</div><div class='summary-metric-grid metric-pair'>");
+  html += F("</div><div class='summary-metric-grid metric-pair weather-outlook'>");
   html += F("<div class='metric-tile condition-tile'><span class='metric-k'>Condition</span><div class='condition-wrap'><div id='condIcon' class='weather-icon wi-unknown' aria-hidden='true'><span class='wi-main'></span><span class='wi-extra'></span></div><div class='metric-v' id='cond'>");
   html += cond.length() ? cond : String("--");
   html += F("</div></div></div>");
+  html += F("<div class='metric-tile forecast-rain-tile'><span class='metric-k'>Forecasted Rain</span><div class='metric-v' id='forecastRainChip'>");
+  html += (lastForecastUpdate && isfinite(rainNext24h_mm)) ? String(rainNext24h_mm, 1) + " mm" : String("--");
+  html += F("</div><span class='metric-k'>Next 24 hours</span></div>");
   html += F("<div class='metric-tile wind-dir-tile'><span class='metric-k'>Wind Direction</span><div class='wind-compass-wrap'><div id='windCompass' class='wind-compass ");
   html += isfinite(windDirDeg) ? "" : "is-empty";
   html += F("' style='--dir:");
@@ -7614,6 +7620,7 @@ void handleRoot() {
   // 1h & 24h
   html += F("var acc1h=document.getElementById('acc1h');");
   html += F("if(acc1h){var v=(typeof st.rain1hNow==='number')?st.rain1hNow:NaN;acc1h.textContent=isNaN(v)?'--':v.toFixed(1);}");
+  html += F("const forecastRain=document.getElementById('forecastRainChip');if(forecastRain){const v=st.forecastRain24h;forecastRain.textContent=(typeof v==='number'&&Number.isFinite(v))?v.toFixed(1)+' mm':'--';}");
   html += F("const acc24=document.getElementById('acc24'); if(acc24){ const v=(typeof st.rain24hActual==='number')?st.rain24hActual:(typeof st.rain24h==='number'?st.rain24h:NaN); acc24.textContent=isNaN(v)?'--':v.toFixed(1);} ");
 
   html += F("let activeCount=0; if(Array.isArray(st.zones)){ st.zones.forEach((z,idx)=>{");
