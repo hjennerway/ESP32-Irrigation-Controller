@@ -296,3 +296,9 @@ Weather, soil-moisture, MQTT and update-report requests now run outside the cont
 ## Version 3.1.3
 
 The Events page now streams HTML in small chunks to reduce memory pressure. It shows up to 64 recent run entries, newest first, and bounds individual log-line reads. Download CSV retains the complete event history. Both ESP32 and ESP32-S3 updater images include this fix.
+
+## Version 3.1.4
+
+Setup uses smaller HTML chunks and the current in-memory settings. Saving no longer waits for NTP or forces sensor reads; timezone synchronisation restarts only when its settings change. Status polling shares requests, times out stalled requests, and pauses during navigation. Saves that require a restart show a confirmation page before reopening Setup.
+
+The main loop checks valve expiry and watering restrictions before HTTP work and again around background work. Valve transitions request a screen redraw instead of pausing for OLED messages. The loop refreshes its timestamp after web requests and yields for 5 ms between passes.

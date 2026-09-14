@@ -57,7 +57,7 @@ extern "C" {
 // ---------- Hardware ----------
 static const char kFirmwareSignature[] __attribute__((used)) =
   "Original author: Beau Kaczmarek - https://github.com/numerik11/ESP32-Irrigation-Controller";
-static const char kFirmwareVersion[] = "3.1.3";
+static const char kFirmwareVersion[] = "3.1.4";
 static const char kFirmwareBuildDate[] = __DATE__ " " __TIME__;
 static const char kUpdateReportUrl[] =
   "https://irrigation-update-counter.beaukacz86.workers.dev/v1/report";
@@ -495,7 +495,7 @@ const uint8_t I2C_HEALTH_DEBOUNCE = 10;
 uint8_t i2cFailCount = 0;
 
 // Timing
-static const uint32_t LOOP_SLEEP_MS    = 20;
+static const uint32_t LOOP_SLEEP_MS    = 5;
 static const uint32_t WIFI_CHECK_MS    = 10000;
 static const uint32_t I2C_CHECK_MS     = 1000;
 static const uint32_t TIME_QUERY_MS    = 1000;
@@ -734,7 +734,7 @@ static const char* posixForIanaZone(const String& iana) {
   return nullptr;
 }
 
-static void applyTimezoneAndSNTP() {
+static void applyTimezoneAndSNTP(bool waitForSync = true) {
   const char* ntp1 = "pool.ntp.org";
   const char* ntp2 = "time.google.com";
   const char* ntp3 = "time.cloudflare.com";
@@ -755,6 +755,7 @@ static void applyTimezoneAndSNTP() {
       setenv("TZ", buf, 1); tzset(); break;
     }
   }
+  if (!waitForSync) return; // HTTP saves must not wait for an NTP reply.
   time_t now = time(nullptr);
   for (int i=0; i<50 && now < 1000000000; ++i) { delay(200); now = time(nullptr); }
 }
@@ -3820,6 +3821,75 @@ void setup() {
 }
 
 // ---------- Loop ----------
+// Run control checks independently of display refresh and web request duration.
+static void tickIrrigationControl() {
+  const uint32_t now = millis();
+  if (now - lastTimeQuery >= TIME_QUERY_MS) {
+    lastTimeQuery = now;
+    time_t nowTime = time(nullptr);
+    localtime_r(&nowTime, &cachedTm);
+  }
+
+  if (cachedTm.tm_hour == 0 && cachedTm.tm_min == 0) {
+    if (!midnightDone) {
+      memset(lastCheckedMinute, -1, sizeof(lastCheckedMinute));
+      todayMin_C = NAN;
+      todayMax_C = NAN;
+      midnightDone = true;
+    }
+  } else midnightDone = false;
+
+  enforceNoWaterPeriod();
+  checkWindRain();
+  stopAutoZonesForBlock();
+  // Expiry is checked on every control pass, not only on the 1-second start tick.
+  for (int z = 0; z < (int)zonesCount; ++z) {
+    if (zoneActive[z] && hasDurationCompleted(z)) turnOffZone(z);
+  }
+  // -------- SCHEDULER (supports sequential or concurrent) --------
+  if (now - lastScheduleTick >= SCHEDULE_TICK_MS) {
+    lastScheduleTick = now;
+
+    bool anyActive = false;
+    for (int z=0; z<(int)zonesCount; z++) {
+      if (zoneActive[z]) { anyActive = true; break; }
+    }
+
+    if (!isBlockedNow()) {
+      for (int z=0; z<(int)zonesCount; z++) {
+        if (shouldStartZone(z)) {
+          // Cancel when blocked/rain; queue during wind so it can run later.
+          if (isBlockedNow()) { cancelStart(z, "BLOCKED", false); continue; }
+          if (rainActive)     { cancelStart(z, "RAIN",    true ); continue; }
+          if (windBlocksZone(z)) { pendingStart[z] = true; logEvent(z,"QUEUED","WIND",false); continue; }
+
+          if (!runZonesConcurrent) {
+            // sequential: only start if nothing is running; else queue (still allowed)
+            if (anyActive) { pendingStart[z] = true; logEvent(z,"QUEUED","ACTIVE RUN",false); }
+            else { turnOnZone(z); anyActive = true; }
+          } else {
+            // concurrent: start regardless of other active zones
+            turnOnZone(z); anyActive = true;
+          }
+        }
+      }
+
+      if (!runZonesConcurrent) {
+        // sequential: drain one queued zone if nothing currently running
+        if (!anyActive && !rainActive) {
+          for (int z=0; z<(int)zonesCount; z++) if (pendingStart[z] && !windBlocksZone(z)) { pendingStart[z]=false; turnOnZone(z); break; }
+        }
+      } else if (!rainActive) {
+        // concurrent: start any queued zones once delays clear
+        for (int z=0; z<(int)zonesCount; z++) {
+          if (pendingStart[z] && !windBlocksZone(z)) { pendingStart[z]=false; turnOnZone(z); anyActive = true; }
+        }
+      }
+    }
+  }
+
+}
+
 void loop() {
   static bool firstLoopLogged = false;
   static uint32_t lastWifiCheck = 0;
@@ -3829,12 +3899,14 @@ void loop() {
     Serial.println("[BOOT] first loop");
   }
 
+  tickIrrigationControl();
   uint32_t now = millis();
   #if ENABLE_OTA
   ArduinoOTA.handle();
   #endif
 
-  server.handleClient();  // serve UI first to keep it responsive
+  server.handleClient();
+  now = millis(); // A page load/save may have taken time.
 
   if (WiFi.status() != WL_CONNECTED && now - lastWifiCheck >= WIFI_CHECK_MS) {
     lastWifiCheck = now;
@@ -3849,13 +3921,16 @@ void loop() {
 
   tickUpdateReport();
 
-  enforceNoWaterPeriod();
-  checkWindRain();
   mqttEnsureConnected();
-  mqttPublishStatus(); 
-  tickWeather(); // Queue networking and consume completed results without waiting
   tickManualButtons();
+  tickIrrigationControl(); // Apply HTTP/MQTT/manual commands before background work.
+  tickWeather();
+  mqttPublishStatus();
   tickAutoBacklight();
+  tickIrrigationControl(); // Recheck expiry after sensor reads and weather parsing.
+  server.handleClient(); // Progress queued requests before the display refresh.
+  tickIrrigationControl();
+  now = millis();
 
   // Track transitions to clear/refresh screens
   static bool lastWasDelayScreen = false;
@@ -3879,10 +3954,6 @@ void loop() {
   const bool delayScreenActive = !manualActive &&
                                  !manualDelayBypassActive &&
                                  (hardBlock || cooldownActive || rainActive || (windActive && !windBypassRunning));
-
-  if (hardBlock || cooldownActive || rainActive || windActive) {
-    stopAutoZonesForBlock();
-  }
 
   if (delayScreenActive) {
     if (!lastWasDelayScreen) {
@@ -3930,21 +4001,6 @@ void loop() {
     g_forceHomeReset = true;
   }
 
-  if (now - lastTimeQuery >= TIME_QUERY_MS) {
-    lastTimeQuery = now;
-    time_t nowTime = time(nullptr);
-    localtime_r(&nowTime, &cachedTm);
-  }
-
-  if (cachedTm.tm_hour == 0 && cachedTm.tm_min == 0) {
-    if (!midnightDone) {
-      memset(lastCheckedMinute, -1, sizeof(lastCheckedMinute));
-      todayMin_C = NAN;
-      todayMax_C = NAN;
-      midnightDone = true;
-    }
-  } else midnightDone = false;
-
   if (!useGpioFallback && (now - lastI2cCheck >= I2C_CHECK_MS)) {
     lastI2cCheck = now; checkI2CHealth();
   }
@@ -3959,55 +4015,6 @@ void loop() {
   if (g_statusLedPwmReady && now - lastStatusLedUpdate >= 50) {
     lastStatusLedUpdate = now;
     updateStatusLedPwm();
-  }
-
-  bool anyActive=false;
-  for (int z=0; z<(int)zonesCount; z++) if (zoneActive[z]) { anyActive=true; break; }
-
-  // -------- SCHEDULER (supports sequential or concurrent) --------
-  if (now - lastScheduleTick >= SCHEDULE_TICK_MS) {
-    lastScheduleTick = now;
-
-    for (int z=0; z<(int)zonesCount; z++) {
-      if (zoneActive[z] && hasDurationCompleted(z)) turnOffZone(z);
-    }
-
-    anyActive = false;
-    for (int z=0; z<(int)zonesCount; z++) {
-      if (zoneActive[z]) { anyActive = true; break; }
-    }
-
-    if (!isBlockedNow()) {
-      for (int z=0; z<(int)zonesCount; z++) {
-        if (shouldStartZone(z)) {
-          // Cancel when blocked/rain; queue during wind so it can run later.
-          if (isBlockedNow()) { cancelStart(z, "BLOCKED", false); continue; }
-          if (rainActive)     { cancelStart(z, "RAIN",    true ); continue; }
-          if (windBlocksZone(z)) { pendingStart[z] = true; logEvent(z,"QUEUED","WIND",false); continue; }
-
-          if (!runZonesConcurrent) {
-            // sequential: only start if nothing is running; else queue (still allowed)
-            if (anyActive) { pendingStart[z] = true; logEvent(z,"QUEUED","ACTIVE RUN",false); }
-            else { turnOnZone(z); anyActive = true; }
-          } else {
-            // concurrent: start regardless of other active zones
-            turnOnZone(z); anyActive = true;
-          }
-        }
-      }
-
-      if (!runZonesConcurrent) {
-        // sequential: drain one queued zone if nothing currently running
-        if (!anyActive && !rainActive) {
-          for (int z=0; z<(int)zonesCount; z++) if (pendingStart[z] && !windBlocksZone(z)) { pendingStart[z]=false; turnOnZone(z); break; }
-        }
-      } else if (!rainActive) {
-        // concurrent: start any queued zones once delays clear
-        for (int z=0; z<(int)zonesCount; z++) {
-          if (pendingStart[z] && !windBlocksZone(z)) { pendingStart[z]=false; turnOnZone(z); anyActive = true; }
-        }
-      }
-    }
   }
 
   if (!delayScreenActive && now - lastScreenRefresh >= 1000) {
@@ -6481,23 +6488,9 @@ void turnOnZone(int z) {
 
   logEvent(z, "START", src, false);
 
-  if (displayEnabled && !displayUseTft) {
-    display.clearDisplay();
-    display.setTextSize(2);
-    display.setCursor(2, 0);
-    display.print(zoneNames[z]);
-    display.print(" ON");
-    display.display();
-    delay(350);
-  }
-
-  // Force a clean redraw immediately for TFT (no ON splash delay).
-  if (displayEnabled && displayUseTft) {
-    g_forceHomeReset = true;
-    g_forceRunReset = true;
-    tft.fillScreen(C_BG);
-  }
-  HomeScreen();
+  g_forceHomeReset = true;
+  g_forceRunReset = true;
+  lastScreenRefresh = 0; // loop() renders the new state after control work.
 }
 
 void turnOffZone(int z) {
@@ -6533,25 +6526,10 @@ void turnOffZone(int z) {
     setWaterSourceRelays(false, false);
   }
 
-  if (displayEnabled && !displayUseTft) {
-    display.clearDisplay();
-    display.setTextSize(2);
-    display.setCursor(4, 0);
-    display.print(zoneNames[z]);
-    display.print(" OFF");
-    display.display();
-    delay(350);
-  }
-  if (displayEnabled && displayUseTft) {
-    g_forceHomeReset = true;
-    g_forceRunReset = true;
-    if (!anyStillOn) tft.fillScreen(C_BG);
-  }
-
-  // Ensure the display returns to Home after showing the OFF banner
-  HomeScreen();
+  g_forceHomeReset = true;
+  g_forceRunReset = true;
+  lastScreenRefresh = 0; // loop() renders the new state after control work.
 }
-
 
 bool turnOnValveManual(int z, String* error) {
   if (z < 0 || z >= (int)zonesCount || z >= (int)MAX_ZONES) {
@@ -7784,11 +7762,14 @@ void handleRoot() {
 // Setup Page 
 void handleSetupPage() {
   HttpScope _scope;
-  loadConfig();
-  sanitizePinConfig();
+  // Settings are loaded at boot and updated in RAM by the save handlers.
   // Stream this large page in sections. A classic ESP32 cannot reliably grow
   // one contiguous String large enough for the complete setup form.
-  String html; html.reserve(12000);
+  String html;
+  if (!html.reserve(7000)) {
+    server.send(503, "text/plain", "Not enough memory to open Setup. Please retry.");
+    return;
+  }
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/html", "");
   auto flush = [&](){
@@ -7796,6 +7777,7 @@ void handleSetupPage() {
       server.sendContent(html);
       html = "";
     }
+    delay(0);
   };
   const int uiMaxGpio = 
   #if defined(CONFIG_IDF_TARGET_ESP32)
@@ -7820,12 +7802,15 @@ void handleSetupPage() {
   auto addTzOption = [&](const char* name, const char* posix) {
     html += F("<option value='");
     html += name;
+  if (html.length() >= 3000) flush();
     html += F("' data-posix='");
     html += posix;
+  if (html.length() >= 3000) flush();
     html += F("'");
     if (tzIANA == name) html += F(" selected");
     html += F(">");
     html += name;
+  if (html.length() >= 3000) flush();
     html += F("</option>");
   };
 
@@ -7850,6 +7835,7 @@ void handleSetupPage() {
   html += F(".setup-overview-title{margin:0 0 12px 0;font-size:.78rem;letter-spacing:.16em;text-transform:uppercase;font-weight:850;color:#38bdf8}");
   html += F(".setup-badges{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}");
   html += F(".setup-badge{padding:12px 13px;border-radius:15px;border:1px solid rgba(92,131,125,.24);background:linear-gradient(180deg,rgba(255,255,255,.08),rgba(147,197,253,.04))}");
+  if (html.length() >= 3000) flush();
   html += F(".setup-badge-k{font-size:.73rem;letter-spacing:.14em;text-transform:uppercase;color:#9ab4ad;font-weight:800}");
   html += F(".setup-badge-v{margin-top:6px;font-size:1rem;font-weight:760;color:#f0f8f3}");
   html += F(".setup-nav{display:flex;gap:10px;flex-wrap:wrap;margin:0 0 16px;padding:8px;border-radius:16px;position:sticky;top:10px;z-index:8;");
@@ -7864,6 +7850,7 @@ void handleSetupPage() {
   html += F(".save-confirm.show{display:inline-flex;align-items:center}");
   html += F(".card-intro{margin:0 0 8px;color:#9ab4ad;font-size:.9rem;max-width:62ch}");
   html += F(".theme-switch{display:flex;align-items:center;gap:6px;font-weight:700;color:#d5e4de}");
+  if (html.length() >= 3000) flush();
   html += F(".switch{position:relative;display:inline-block;width:42px;height:24px;min-width:unset}");
   html += F(".switch input{opacity:0;width:0;height:0}");
   html += F(".slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:#16262a;border:1px solid #284449;transition:.2s;border-radius:999px}");
@@ -7886,6 +7873,7 @@ void handleSetupPage() {
   html += F("input[type=number].in-sm{max-width:160px}");
   html += F("input[type=number].in-md{max-width:240px}");
   html += F(".row{display:flex;align-items:center;gap:12px;margin:10px 0;padding-top:10px;border-top:1px solid rgba(41,69,74,.7);flex-wrap:wrap}.row small{color:#9ab4ad;font-size:.85rem}");
+  if (html.length() >= 3000) flush();
   html += F(".card h3 + .row{border-top:none;padding-top:0}");
   html += F(".btn{background:linear-gradient(180deg,#2563eb,#1e40af);color:#fff;border:1px solid rgba(0,0,0,.18);border-radius:12px;padding:10px 14px;font-weight:700;cursor:pointer;box-shadow:0 6px 16px rgba(30,64,175,.28);font-size:.95rem}");
   html += F(".btn-alt{background:#17272b;color:#e7f1ec;border:1px solid #294b73;border-radius:12px;padding:10px 14px;font-size:.95rem}");
@@ -7902,6 +7890,7 @@ void handleSetupPage() {
   html += F(".switchline{display:flex;gap:12px;align-items:center;flex-wrap:wrap}");
   html += F("input[type=checkbox]:not(#themeToggle),input[type=radio]{appearance:none;-webkit-appearance:none;width:18px;height:18px;margin:0;flex:0 0 18px;display:inline-grid;place-content:center;cursor:pointer;");
   html += F("border:1.6px solid rgba(255,255,255,.78);background:transparent;box-shadow:none;transition:border-color .12s ease,background .12s ease,box-shadow .12s ease,transform .06s ease}");
+  if (html.length() >= 3000) flush();
   html += F("input[type=checkbox]:not(#themeToggle){border-radius:6px}");
   html += F("input[type=radio]{border-radius:999px}");
   html += F("input[type=checkbox]:not(#themeToggle)::before,input[type=radio]::before{content:'';display:block;transform:scale(0);transition:transform .12s ease}");
@@ -7927,6 +7916,7 @@ void handleSetupPage() {
   html += F("details.collapse summary{cursor:pointer;outline:none;list-style:none;font-weight:800;font-size:1.05rem;color:#e7f1ec;padding:4px 0}");
   html += F("details.collapse summary::-webkit-details-marker{display:none}");
   html += F("details.collapse summary:after{content:'>';margin-left:8px;transition:transform .18s ease;display:inline-block;width:26px;height:26px;line-height:24px;text-align:center;border-radius:999px;border:1px solid rgba(92,131,125,.22);background:rgba(255,255,255,.04)}");
+  if (html.length() >= 3000) flush();
   html += F("details.collapse[open] summary:after{transform:rotate(90deg)}");
   html += F("details.collapse[open] summary:after{background:rgba(37,99,235,.16);border-color:rgba(147,197,253,.3)}");
   html += F(".collapse-body{margin-top:10px;padding-top:4px}");
@@ -7957,6 +7947,7 @@ void handleSetupPage() {
   html += F("html[data-theme='light'] input[type=text],html[data-theme='light'] input[type=number],html[data-theme='light'] select,html[data-theme='light'] textarea{background:#f7faf8;color:#14232b;border-color:#c9d9d0}");
   html += F("html[data-theme='light'] .chip{background:#eef6f2;border-color:#c9d9d0;color:#213433}");
   html += F("html[data-theme='light'] input[type=checkbox]:not(#themeToggle),html[data-theme='light'] input[type=radio]{border-color:#8aa59c;background:rgba(255,255,255,.78);box-shadow:inset 0 1px 0 rgba(255,255,255,.75)}");
+  if (html.length() >= 3000) flush();
   html += F("html[data-theme='light'] input[type=checkbox]:not(#themeToggle)::before{border-right-color:#1e40af;border-bottom-color:#1e40af}");
   html += F("html[data-theme='light'] input[type=radio]::before{background:#1e40af}");
   html += F("html[data-theme='light'] input[type=checkbox]:not(#themeToggle):checked,html[data-theme='light'] input[type=radio]:checked{border-color:#2563eb;background:#ffffff;box-shadow:0 0 0 3px rgba(37,99,235,.12)}");
@@ -7975,6 +7966,7 @@ void handleSetupPage() {
   html += F("html[data-theme='light'] .setup-badge-v{color:#14232b}");
   html += F("html[data-theme='light'] .setup-nav{background:rgba(255,255,255,.8);border-color:#d7e2f0;box-shadow:0 10px 28px rgba(16,24,40,.08)}");
   html += F("html[data-theme='light'] .setup-nav a{background:rgba(255,255,255,.88);border-color:#d7e2f0;color:#213433}");
+  if (html.length() >= 3000) flush();
   html += F("html[data-theme='light'] .setup-nav a:hover{background:#eef5ff;border-color:#b7d5c8;box-shadow:0 10px 24px rgba(37,99,235,.08)}");
   html += F("html[data-theme='light'] .card-intro{color:#607571}");
   html += F("html[data-theme='light'] .row{border-top-color:#e4ece7}");
@@ -8001,6 +7993,7 @@ void handleSetupPage() {
   html += F(".theme-switch{font-size:.88rem}");
   html += F(".card{position:relative;overflow:hidden}");
   html += F(".card::before{content:'';position:absolute;left:0;right:0;top:0;height:3px;background:linear-gradient(90deg,#2563eb,#38bdf8)}");
+  if (html.length() >= 3000) flush();
   html += F("input[type=text],input[type=number],select{font-family:'Sora','Trebuchet MS',sans-serif}");
   html += F("input[type=text]:focus-visible,input[type=number]:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px solid #2563eb;outline-offset:1px;box-shadow:0 0 0 3px rgba(37,99,235,.18)}");
   html += F(".btn,.btn-alt{font-weight:760;letter-spacing:.16px}");
@@ -8017,6 +8010,7 @@ void handleSetupPage() {
   html += F(".setup-badge{border-radius:8px;background:#10233d;border-color:#294b73}.setup-nav,.setup-actions-top{border-color:#24405f;box-shadow:0 8px 22px rgba(0,0,0,.18)}");
   html += F(".page-kicker{color:#93c5fd}.card{border-color:#24405f;box-shadow:0 8px 24px rgba(0,0,0,.22)}.card:hover{transform:none;box-shadow:0 10px 28px rgba(0,0,0,.26)}.card h3{border-bottom:1px solid #294b73;letter-spacing:0}");
   html += F(".slider{border-color:#294b73}.switch input:checked + .slider{background:#2563eb;border-color:#2563eb}.btn{background:linear-gradient(180deg,#2563eb,#1e40af);box-shadow:0 6px 16px rgba(37,99,235,.22)}");
+  if (html.length() >= 3000) flush();
   html += F(".row{gap:10px 14px}details.collapse summary:after{content:'>';border-radius:8px}input:focus-visible,select:focus-visible,input[type=text]:focus-visible,input[type=number]:focus-visible{outline-color:#38bdf8;box-shadow:0 0 0 3px rgba(37,99,235,.18)}");
   html += F("html[data-theme='light'] body{background:linear-gradient(180deg,#fbfdff,#f3f7fc)}html[data-theme='light'] .page-head,html[data-theme='light'] .setup-hero,html[data-theme='light'] .card{box-shadow:0 8px 24px rgba(16,24,40,.08)}");
   html += F("html[data-theme='light'] .page-kicker{color:#2563eb}html[data-theme='light'] .card h3{border-bottom-color:#2563eb}html[data-theme='light'] .btn{background:linear-gradient(180deg,#2563eb,#1e40af)}html[data-theme='light'] .setup-badge{background:linear-gradient(180deg,#ffffff,#eef5ff);border-color:#d7e2f0}");
@@ -8024,37 +8018,51 @@ void handleSetupPage() {
   html += F("input[type=checkbox]:not(#themeToggle):focus-visible,input[type=radio]:focus-visible{box-shadow:0 0 0 3px rgba(37,99,235,.2)}html[data-theme='light'] input[type=checkbox]:not(#themeToggle)::before{border-right-color:#1e40af;border-bottom-color:#1e40af}");
   html += F("html[data-theme='light'] input[type=radio]::before{background:#1e40af}html[data-theme='light'] input[type=checkbox]:not(#themeToggle):checked,html[data-theme='light'] input[type=radio]:checked{border-color:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,.12)}");
   html += F("html[data-theme='light'] input[type=checkbox]:not(#themeToggle):focus-visible,html[data-theme='light'] input[type=radio]:focus-visible{border-color:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,.14)}html[data-theme='light'] .setup-nav a:hover{background:#eef5ff;border-color:#bfdbfe;box-shadow:0 10px 24px rgba(37,99,235,.08)}");
+  if (html.length() >= 3000) flush();
   html += F("details.collapse summary,html[data-theme='dark'] details.collapse summary{color:#ffffff}html[data-theme='light'] details.collapse summary{color:#000000}");
   html += F("@media(max-width:760px){.page-head{padding:10px 12px}.page-head h1{font-size:1.2rem}.setup-hero{grid-template-columns:1fr}.setup-badges{grid-template-columns:1fr 1fr}.setup-nav{top:8px;flex-wrap:nowrap;overflow:auto;padding-bottom:6px}.setup-nav a{white-space:nowrap}.setup-actions-top{top:8px;z-index:9;padding:10px;border-radius:14px;background:rgba(13,23,24,.88);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);border:1px solid rgba(92,131,125,.2)}.row{padding-top:8px;flex-direction:column;align-items:stretch}.row label{min-width:0;width:100%}.row .btn,.row .btn-alt{width:100%}.switchline{align-items:flex-start}}");
+  flush();
   html += F(":root{--setup-bg:#f3f7fc;--setup-panel:#ffffff;--setup-ink:#172033;--setup-muted:#68758a;--setup-line:#dbe4ef;--setup-blue:#2563eb}html[data-theme='dark']{--setup-bg:#0b1220;--setup-panel:#111c2e;--setup-ink:#e7eef9;--setup-muted:#9aa9bd;--setup-line:#293a54;--setup-blue:#60a5fa}.wrap{max-width:1180px;margin:0 auto;padding:0 20px}body{background:var(--setup-bg);color:var(--setup-ink)}.page-head{margin:0 -20px 16px;padding:16px 20px;border:0;border-bottom:1px solid var(--setup-line);border-radius:0;background:var(--setup-panel);box-shadow:0 4px 14px rgba(15,23,42,.06)}.page-kicker{color:var(--setup-blue)}.page-sub,.setup-hero-copy p,.card-intro,.row small{color:var(--setup-muted)}.setup-hero{display:block;margin:0 -20px 16px;padding:18px 20px;border-radius:0;background:var(--setup-panel);border:0;border-bottom:1px solid var(--setup-line);box-shadow:none}.setup-overview-title{color:var(--setup-blue);margin-bottom:10px}.setup-badges{grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.setup-badge{border-radius:7px;padding:12px;background:var(--setup-bg);border:1px solid var(--setup-line)}.setup-badge-k{color:var(--setup-muted)}.setup-badge-v{color:var(--setup-ink)}.setup-nav{top:8px;margin:0 0 10px;padding:7px;border-radius:7px;background:var(--setup-panel);border:1px solid var(--setup-line);box-shadow:0 5px 14px rgba(15,23,42,.08)}.setup-nav a{border-radius:6px;background:transparent;color:var(--setup-muted);border-color:transparent;padding:8px 11px}.setup-nav a:hover{transform:none;background:rgba(37,99,235,.1);border-color:rgba(37,99,235,.22);color:var(--setup-blue);box-shadow:none}.setup-actions-top{top:61px;margin:0 0 16px;padding:8px;border-radius:7px;background:var(--setup-panel);border:1px solid var(--setup-line);box-shadow:0 5px 14px rgba(15,23,42,.08)}.card{border-radius:7px;background:var(--setup-panel);border:1px solid var(--setup-line);box-shadow:0 6px 18px rgba(15,23,42,.06)}.card::before{height:2px;background:var(--setup-blue)}.card h3{color:var(--setup-ink)}details.collapse summary{color:var(--setup-ink);padding:7px 0;font-size:1rem}details.collapse summary:after{border-radius:6px;border-color:var(--setup-line);background:var(--setup-bg)}.collapse-body{border-top:1px solid var(--setup-line);padding-top:12px}.row{border-top-color:var(--setup-line)}label{color:var(--setup-ink)}input[type=text],input[type=number],select,textarea{background:var(--setup-bg);color:var(--setup-ink);border-color:var(--setup-line);border-radius:6px}.chip{background:var(--setup-bg);border-color:var(--setup-line);color:var(--setup-ink);border-radius:6px}.btn,.btn-alt{border-radius:6px}.btn-alt{background:var(--setup-bg);color:var(--setup-ink);border-color:var(--setup-line)}.save-confirm{margin-left:auto}@media(max-width:760px){.wrap{padding:0 12px}.page-head,.setup-hero{margin-left:-12px;margin-right:-12px;padding-left:12px;padding-right:12px}.setup-badges{grid-template-columns:repeat(2,minmax(0,1fr))}.setup-nav{top:8px}.setup-actions-top{top:58px}.setup-actions-top .save-confirm{margin-left:0}.row{padding-top:10px}}@media(max-width:440px){.setup-badges{grid-template-columns:1fr}.setup-actions-top .btn,.setup-actions-top .btn-alt{flex:1 1 100%}}</style></head><body>");
+  if (html.length() >= 3000) flush();
   // Setup-only compact styling uses the dashboard typography, palette and spacing.
+  flush();
   html += F("<style>html,body,input,select,button{font-family:'Segoe UI',Arial,sans-serif}html body{background:var(--setup-bg)}.wrap{margin:12px auto;padding:0 14px}html[data-theme] .page-head{margin:0 0 10px;padding:10px 12px;border-radius:7px;background:#1e3a8a;border:0;color:#fff}html .page-head h1{font-size:1rem;margin:3px 0;color:#fff}html .page-head .page-kicker,html .page-head .page-sub{color:#dbeafe}.page-sub{font-size:.78rem}.page-head-copy{min-width:0}.theme-switch{flex-shrink:0}html[data-theme] .setup-hero{margin:0 0 10px;padding:10px 12px;border:1px solid var(--setup-line);border-radius:7px;background:var(--setup-panel)}.setup-overview-title{margin-bottom:7px;font-size:.68rem}.setup-badges{grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}.setup-badge{padding:7px 9px;min-width:0}.setup-badge-k{font-size:.6rem;letter-spacing:.08em}.setup-badge-v{font-size:.85rem;overflow-wrap:anywhere}#setupForm>.setup-nav{position:static;flex-wrap:wrap;overflow:visible;gap:5px;padding:6px;margin-bottom:8px}.setup-nav a{flex:1 1 auto;padding:7px 9px;font-size:.75rem}#setupForm>.setup-actions-top{position:static;gap:6px;padding:7px;margin-bottom:8px}.setup-actions-top .btn,.setup-actions-top .btn-alt{flex:0 1 auto;padding:8px 10px;font-size:.78rem}#setupForm .card.narrow{box-sizing:border-box;width:100%;min-width:0;margin:0 0 8px;padding:8px 12px;animation:none}#setupForm details.collapse>summary{min-height:30px;padding:4px 0;font-size:.88rem}#setupForm .collapse-body{padding-top:8px}.card-intro{margin:0 0 8px;font-size:.8rem}.row{gap:8px;padding-top:8px;margin:8px 0}.setup-merged{border-top:1px solid var(--setup-line);margin-top:12px;padding-top:8px}.setup-merged h3{font-size:.85rem}#setupForm [id$='-card']{scroll-margin-top:12px}input,select{max-width:100%;box-sizing:border-box}@media(max-width:760px){.wrap{padding:0 10px;margin:10px auto}.setup-badges{grid-template-columns:repeat(2,minmax(0,1fr))}.page-head{gap:8px;flex-wrap:wrap}.setup-actions-top .btn,.setup-actions-top .btn-alt{flex:1 1 auto}.row label{min-width:0}.panel-split{grid-template-columns:minmax(0,1fr)}}</style>");
+  if (html.length() >= 3000) flush();
   flush();
 
   html += F("<div class='wrap'><div class='page-head'><div class='page-head-copy'><div class='page-kicker'>Controller configuration</div><h1>System Setup</h1><div class='page-sub'>Firmware v");
   html += kFirmwareVersion;
+  if (html.length() >= 3000) flush();
   html += F(" - Start with zones and water source, then set weather, time, display, and hardware pins.</div></div>");
   html += F("<div class='theme-switch'><span>Light</span><label class='switch'><input type='checkbox' id='themeToggle'><span class='slider'></span></label><span>Dark</span></div>");
   html += F("</div>");
   html += F("<div class='setup-hero badges-only'><div class='setup-overview-title'>Current Configuration</div><div class='setup-badges'>");
   html += F("<div class='setup-badge'><div class='setup-badge-k'>Zone Count</div><div class='setup-badge-v'>"); html += String(zonesCount); html += F(" configured</div></div>");
+  if (html.length() >= 3000) flush();
   html += F("<div class='setup-badge'><div class='setup-badge-k'>Display</div><div class='setup-badge-v'>"); html += setupDisplayLabel; html += F("</div></div>");
+  if (html.length() >= 3000) flush();
   html += F("<div class='setup-badge'><div class='setup-badge-k'>Water Source</div><div class='setup-badge-v'>"); html += setupTankLabel; html += F("</div></div>");
+  if (html.length() >= 3000) flush();
   html += F("<div class='setup-badge'><div class='setup-badge-k'>Time Mode</div><div class='setup-badge-v'>"); html += setupTzLabel; html += F("</div></div>");
+  if (html.length() >= 3000) flush();
   html += F("<div class='setup-badge'><div class='setup-badge-k'>Forecast Site</div><div class='setup-badge-v'>"); html += setupWeatherLabel; html += F("</div></div>");
+  if (html.length() >= 3000) flush();
   html += F("<div class='setup-badge'><div class='setup-badge-k'>Forecast Model</div><div class='setup-badge-v'>"); html += setupModelLabel; html += F("</div></div>");
+  if (html.length() >= 3000) flush();
   html += F("</div></div>");
   html += F("<style>#setupForm{display:flex;flex-direction:column}.card.narrow{width:300mm;max-width:100%;align-self:center}#setupForm>.setup-nav{order:0}#setupForm>.setup-actions-top{order:1}#smart-card{order:10}#delays-card{order:20}#no-water-card{order:25}#weather-card{order:30}#tank-card{order:40}#rain-card{order:50}#timezone-card{order:60}#pins-card{order:70}#i2c-card{order:80}#buttons-card{order:90}#display-card{order:100}#advanced-card{order:110}#schedule-html-card{order:120}#mqtt-card{order:130}#ota-card{order:140}#scheduleHtmlCss{max-width:none;min-height:220px;resize:vertical;font:13px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace}</style>");
   html += F("<form id='setupForm' action='/configure' method='POST' novalidate>");
   html += F("<div class='setup-nav'><a href='#smart-card'>Smart Watering</a><a href='#delays-card'>Delays &amp; Pause</a><a href='#no-water-card'>No-Watering Periods</a><a href='#weather-card'>Forecast</a><a href='#tank-card'>Water &amp; Tank</a><a href='#rain-card'>Rain Inputs</a><a href='#timezone-card'>Timezone</a><a href='#pins-card'>GPIO</a><a href='#i2c-card'>I2C</a><a href='#buttons-card'>Buttons</a><a href='#display-card'>Display</a><a href='#advanced-card'>TFT Pins</a><a href='#schedule-html-card'>Schedule CSS</a><a href='#mqtt-card'>MQTT</a><a href='#ota-card'>Firmware</a></div>");
   html += F("<div class='setup-actions-top'><button class='btn' type='submit' id='btn-save-setup'>Save Changes</button><a class='btn-alt' href='/'>Home</a><a class='btn-alt' href='https://numerik11.github.io/ESP32-Irrigation-Controller/web-flasher/?current=");
   html += kFirmwareVersion;
+  if (html.length() >= 3000) flush();
   html += F("' target='_blank' rel='noopener'>Web Flasher</a><a class='btn-alt' href='/update'>Browser OTA</a><button class='btn-alt' type='button' id='btn-clear-cooldown'>Clear After-Rain Delay</button><button class='btn btn-danger' type='button' onclick=\"if(confirm('Reboot controller now?'))fetch('/reboot',{method:'POST'})\">Reboot</button><span class='save-confirm' id='save-confirm'>Saved</span></div>");
 
   // Tank (available for all modes; water source switching works with any zone count)
   html += F("<div class='card narrow' id='tank-card'><details class='collapse'><summary>Water Source & Tank</summary><div class='collapse-body'><p class='card-intro'>Control how the controller chooses between tank and mains and where the tank sensor is connected.</p>");
   html += F("<div class='row switchline'><label>Enable Tank</label><input type='checkbox' name='tankEnabled' ");
   html += (tankEnabled ? "checked" : "");
+  if (html.length() >= 3000) flush();
   html += F("><small>Unchecked = ignore tank level and force mains</small></div>");
   html += F("<div id='tankCard'>");
 
@@ -8077,19 +8085,23 @@ void handleSetupPage() {
 
   html += F("<small>");
   html += "Tank/City Water switching (USE BACKFLOW PREVENTION!)";
+  if (html.length() >= 3000) flush();
   html += F("</small></div>");
 
   html += F("<div class='row'><label>Tank Low Threshold (%)</label>"
             "<input class='in-xs' type='number' min='0' max='100' name='tankThresh' value='");
   html += String(tankLowThresholdPct);
+  if (html.length() >= 3000) flush();
   html += F("'><small>Switch to city water if tank drops below this level</small></div>");
 
   #if defined(CONFIG_IDF_TARGET_ESP32)
     html += F("<div class='row'><label>Tank Level Sensor GPIO</label><input class='in-xs' type='number' min='-1' max='39' name='tankLevelPin' value='");
     html += String(tankLevelPin); html += F("'><small>-1 disables. ADC1 pin (ESP32: GPIO32-39)</small></div>");
+  if (html.length() >= 3000) flush();
   #else
     html += F("<div class='row'><label>Tank Level Sensor GPIO</label><input class='in-xs' type='number' min='-1' max='20' name='tankLevelPin' value='");
     html += String(tankLevelPin); html += F("'><small>-1 disables. ADC pin (ESP32-S3: GPIO1-20)</small></div>");
+  if (html.length() >= 3000) flush();
   #endif
   html += F("<div class='row'><label></label><a class='btn-alt' href='/tank'>Calibrate Tank</a></div>");
   html += F("</div>"); // end tankCard
@@ -8105,10 +8117,13 @@ void handleSetupPage() {
   html += F("<div class='subhead'>Delay Toggles</div><hr class='hr'>");
   html += F("<div class='row switchline'><label>Rain Delay</label><input type='checkbox' name='rainDelay' ");
   html += (rainDelayEnabled ? "checked" : ""); html += F("></div>");
+  if (html.length() >= 3000) flush();
   html += F("<div class='row switchline'><label>Wind Delay</label><input type='checkbox' name='windCancelEnabled' ");
   html += (windDelayEnabled ? "checked" : ""); html += F("></div>");
+  if (html.length() >= 3000) flush();
   html += F("<div class='row switchline'><label>System Pause</label><input type='checkbox' name='pauseEnable' ");
   html += (systemPaused ? "checked" : ""); html += F("><small>Enable System Pause</small></div>");
+  if (html.length() >= 3000) flush();
   html += F("<div class='row' style='gap:8px;flex-wrap:wrap'>");
   html += F("<button class='btn' type='button' id='btn-pause-24'>Pause 24h</button>");
   html += F("<button class='btn' type='button' id='btn-pause-7d'>Pause 7d</button>");
@@ -8118,6 +8133,7 @@ void handleSetupPage() {
     {
     uint32_t remain = (pauseUntilEpoch > nowEp && systemPaused) ? (pauseUntilEpoch - nowEp) : 0;
     html += String(remain/3600);
+  if (html.length() >= 3000) flush();
   }
   html += F("'></div>");
   html += F("</div>");
@@ -8128,11 +8144,14 @@ void handleSetupPage() {
   html += F("<div class='subhead'>Thresholds & Timers</div><hr class='hr'>");
   html += F("<div class='row'><label>Wind Threshold (m/s)</label><input class='in-sm' type='number' step='0.1' min='0' max='50' name='windSpeedThreshold' value='");
   html += String(windSpeedThreshold,1); html += F("'></div>");
+  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>After-Rain Delay (hours)</label><input class='in-sm' type='number' min='0' max='720' name='rainCooldownHours' value='");
   html += String(rainCooldownMin / 60);
+  if (html.length() >= 3000) flush();
   html += F("'><small>Delay period after rain stops</small></div>");
   html += F("<div class='row'><label>Rain Threshold 24h (mm)</label><input class='in-sm' type='number' min='0' max='200' name='rainThreshold24h' value='");
   html += String(rainThreshold24h_mm);
+  if (html.length() >= 3000) flush();
   html += F("'><small>After-Rain Delay if above threshold</small></div>");
   html += F("</div>");
 
@@ -8147,18 +8166,22 @@ void handleSetupPage() {
   html += F("<div class='subhead'>Runtime Rules</div><hr class='hr'>");
   html += F("<div class='row switchline'><label>Smart Watering</label><input type='checkbox' name='smartWatering' ");
   html += (smartWateringEnabled ? "checked" : "");
+  if (html.length() >= 3000) flush();
   html += F("><small>Adjust scheduled and manual runtimes using these rules</small></div>");
   html += F("<div class='row'><label for='smartTempBasis'>Temperature Basis</label><select id='smartTempBasis' name='smartTempBasis'>");
   const char* basisLabels[]={"Current temperature (forecast max fallback)","Forecast maximum today","Forecast average (daily min/max midpoint)"};
   for (int i=0;i<3;++i) {
     html += F("<option value='"); html += String(i); html += F("'");
+  if (html.length() >= 3000) flush();
     if (smartTempBasis==i) html += F(" selected");
     html += F(">"); html += basisLabels[i]; html += F("</option>");
+  if (html.length() >= 3000) flush();
   }
   html += F("</select><small>Forecast maximum is recommended for early-morning watering. If the selected forecast is unavailable, no temperature adjustment is applied.</small></div>");
   html += F("<style>#smart-card .panel-split>div{min-width:0}.smart-scroll{overflow-x:auto}.smart-table{width:100%;border-collapse:collapse}.smart-table th,.smart-table td{padding:8px 6px;text-align:left;border-bottom:1px solid var(--border,#ddd)}.smart-table input{width:82px;min-width:65px}</style>");
   html += F("<div class='smart-scroll'><table class='smart-table'><thead><tr><th>Condition</th><th>Temperature (<span data-temp-unit>");
   html += temperatureUnitChar();
+  if (html.length() >= 3000) flush();
   html += F("</span>)</th><th>Runtime Adjustment (%)</th></tr></thead><tbody>");
   const char* ruleNames[]={"Cool","Hot","Very Hot"};
   const char* tempNames[]={"smartCoolTemp","smartHotTemp","smartVeryHotTemp"};
@@ -8168,45 +8191,63 @@ void handleSetupPage() {
   for (int i=0;i<3;++i) {
     if (i==1) html += F("<tr><th>Normal</th><td id='smartNormalRange'></td><td>0%</td></tr>");
     html += F("<tr><th>"); html += ruleNames[i]; html += F("</th><td>");
+  if (html.length() >= 3000) flush();
     html += i==0 ? F("Below ") : F("At/above ");
+  if (html.length() >= 3000) flush();
     html += F("<input required data-smart-temp type='number' step='0.1' name='"); html += tempNames[i];
+  if (html.length() >= 3000) flush();
     html += F("' aria-label='"); html += ruleNames[i]; html += F(" temperature' value='");
+  if (html.length() >= 3000) flush();
     html += String(temperatureForDisplay(ruleTemps[i]),1);
+  if (html.length() >= 3000) flush();
     html += F("'></td><td><input required type='number' min='-100' max='300' name='"); html += pctNames[i];
+  if (html.length() >= 3000) flush();
     html += F("' aria-label='"); html += ruleNames[i]; html += F(" runtime adjustment percent' value='");
+  if (html.length() >= 3000) flush();
     html += String(rulePcts[i]); html += F("'></td></tr>");
+  if (html.length() >= 3000) flush();
   }
   html += F("</tbody></table></div>");
   html += F("<div class='row'><label>Minimum Adjusted Runtime (minutes)</label><input class='in-sm' type='number' min='0' max='1440' name='smartMinimumMin' value='");
   html += String(smartMinimumMin);
+  if (html.length() >= 3000) flush();
   html += F("'><small>Use 0 to apply the full runtime reduction. A minimum of 5 keeps a five-minute schedule at five minutes even when the Global Runtime Factor is lower.</small></div>");
   html += F("<div class='row'><label>Actual Rain Skip Above (mm)</label><input class='in-sm' type='number' step='0.1' min='0' max='200' name='smartActualRainMm' value='");
   html += String(smartActualRainSkipMm, 1); html += F("'><small>Light-rain adjustment up to this amount (%)</small><input class='in-sm' type='number' min='-100' max='300' name='smartLightRainPct' value='");
+  if (html.length() >= 3000) flush();
   html += String(smartLightRainAdjustPct); html += F("'></div>");
+  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>Forecast Rain Skip Above (mm)</label><input class='in-sm' type='number' step='0.1' min='0' max='200' name='smartForecastRainMm' value='");
   html += String(smartForecastRainSkipMm, 1); html += F("'><small>Forecast total for the next 24 hours</small></div>");
+  if (html.length() >= 3000) flush();
   html += F("</div>");
   html += F("<div>");
   html += F("<div class='subhead'>Ground Moisture</div><hr class='hr'>");
   html += F("<div class='row switchline'><label>Enable Ground Moisture</label><input type='checkbox' name='moistureProbeEnabled' ");
   html += (moistureProbeEnabled ? "checked" : "");
+  if (html.length() >= 3000) flush();
   html += F("><small>Wet soil can skip scheduled and manual starts</small></div>");
   html += F("<div class='row'><label>Moisture Source</label><select name='moistureSource'>");
   html += F("<option value='probe'"); html += (!moistureUseMeteo ? " selected" : ""); html += F(">Physical soil moisture probe</option>");
+  if (html.length() >= 3000) flush();
   html += F("<option value='meteo'"); html += (moistureUseMeteo ? " selected" : ""); html += F(">Open-Meteo Soil Moisture (0-1 cm)</option>");
+  if (html.length() >= 3000) flush();
   html += F("</select><small>Open-Meteo uses your forecast coordinates and automatic model selection. Modelled volumetric water content: 0.30 m3/m3 = 30%. Review the skip threshold for this source. GPIO and Dry/Wet calibration apply only to the physical probe.</small></div>");
   #if defined(CONFIG_IDF_TARGET_ESP32)
     html += F("<div class='row'><label>Moisture Probe GPIO</label><input class='in-xs' type='number' min='-1' max='39' name='moisturePin' value='");
     html += String(moisturePin); html += F("'><small>ADC1 pin, ESP32 GPIO32-39, or -1 disabled</small></div>");
+  if (html.length() >= 3000) flush();
   #else
     html += F("<div class='row'><label>Moisture Probe GPIO</label><input class='in-xs' type='number' min='-1' max='20' name='moisturePin' value='");
     html += String(moisturePin); html += F("'><small>ADC pin, ESP32-S3 GPIO1-20, or -1 disabled</small></div>");
+  if (html.length() >= 3000) flush();
   #endif
   html += F("<div class='row'><label>Current Moisture</label><div class='chip' id='moistureLiveRaw'>Raw: ");
   if (setupMoistureRaw < 0) html += F("--");
   else html += String(setupMoistureRaw);
   html += F("</div><div class='chip' id='moistureLivePct'>");
   html += moistureUseMeteo ? F("Water volume: ") : F("Wet: ");
+  if (html.length() >= 3000) flush();
   if (setupMoisturePct < 0) html += F("--");
   else { html += String(setupMoisturePct); html += F("%"); }
   html += F("</div><small id='moistureLiveHint'>");
@@ -8217,12 +8258,15 @@ void handleSetupPage() {
   html += F("</small></div>");
   html += F("<div class='row'><label>Moisture Raw Dry</label><input class='in-sm' type='number' min='0' max='4095' name='moistureDryRaw' value='");
   html += String(moistureDryRaw);
+  if (html.length() >= 3000) flush();
   html += F("'><small>Raw ADC value measured in dry soil</small></div>");
   html += F("<div class='row'><label>Moisture Raw Wet</label><input class='in-sm' type='number' min='0' max='4095' name='moistureWetRaw' value='");
   html += String(moistureWetRaw);
+  if (html.length() >= 3000) flush();
   html += F("'><small>Raw ADC value measured in wet soil</small></div>");
   html += F("<div class='row'><label>Moisture Skip Above (%)</label><input class='in-sm' type='number' min='0' max='100' name='moistureSkipPct' value='");
   html += String(moistureSkipThresholdPct);
+  if (html.length() >= 3000) flush();
   html += F("'><small>Skip starts at or above this level. Open-Meteo uses volumetric water percentage.</small></div>");
   html += F("</div>");
   html += F("</div></div></details></div>");
@@ -8232,9 +8276,13 @@ void handleSetupPage() {
   html += F("<div class='card narrow' id='rain-card'><details class='collapse'><summary>Rain Inputs</summary><div class='collapse-body'><p class='card-intro'>Choose which rain sources can stop or delay irrigation. Open-Meteo uses the forecast location below; the physical sensor uses the GPIO here.</p>");
   html += F("<div class='row switchline'><label>Disable Open-Meteo Rain</label><input type='checkbox' name='rainForecastDisabled' ");
   html += (!rainDelayFromForecastEnabled ? "checked" : ""); html += F("><small>Checked = forecast rain will not block starts</small></div>");
+  if (html.length() >= 3000) flush();
   html += F("<div class='row switchline'><label>Use Physical Rain Sensor</label><input type='checkbox' name='rainSensorEnabled' "); html += (rainSensorEnabled?"checked":""); html += F("></div>");
+  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>Rain Sensor GPIO</label><input class='in-xs' type='number' min='0' max='"); html += String(uiMaxGpio); html += F("' name='rainSensorPin' value='"); html += String(rainSensorPin); html += F("'><small>e.g. 27</small></div>");
+  if (html.length() >= 3000) flush();
   html += F("<div class='row switchline'><label>Invert Sensor</label><input type='checkbox' name='rainSensorInvert' "); html += (rainSensorInvert?"checked":""); html += F("><small>Use if board is NO</small></div>");
+  if (html.length() >= 3000) flush();
   html += F("</div></details></div>");
 
   flush();
@@ -8242,44 +8290,70 @@ void handleSetupPage() {
   html += F("<div class='card narrow' id='weather-card'><details class='collapse'><summary>Forecast Location & Model</summary><div class='collapse-body'><p class='card-intro'>Enter the irrigation site coordinates and choose the Open-Meteo forecast model used for dashboard weather, rain delay, wind delay, and Smart Watering.</p>");
   html += F("<div class='row'><label>Open-Meteo</label><a class='btn-alt' id='setupMeteoLink' href='https://open-meteo.com/en/docs?latitude=");
   html += (isfinite(meteoLat) ? String(meteoLat, 6) : String("-35.107600"));
+  if (html.length() >= 3000) flush();
   html += F("&longitude=");
   html += (isfinite(meteoLon) ? String(meteoLon, 6) : String("138.557300"));
+  if (html.length() >= 3000) flush();
   html += F("' target='_blank' rel='noopener'>Open forecast page</a><small>Click to open Open-Meteo using the current coordinates.</small></div>");
   String modelSel = cleanMeteoModel(meteoModel);
   bool modelIsKnown = isKnownMeteoModel(modelSel);
   html += F("<div class='row'><label>Location Name</label><input class='in-wide' type='text' name='meteoLocation' value='"); html += meteoLocation; html += F("'><small>Optional label for UI/logs</small></div>");
+  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>Latitude</label><input class='in-med' type='text' name='meteoLat' value='"); html += latStr; html += F("'><small>e.g. -35.1076</small></div>");
+  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>Longitude</label><input class='in-med' type='text' name='meteoLon' value='"); html += lonStr; html += F("'><small>e.g. 138.5573</small></div>");
+  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>Model</label><select class='in-med' name='meteoModelSelect' id='meteoModelSelect'>");
   html += F("<option value='best_match'");    html += (modelSel == "best_match" ? " selected" : ""); html += F(">Best match</option>");
+  if (html.length() >= 3000) flush();
   html += F("<option value='gfs_seamless'");  html += (modelSel == "gfs_seamless" ? " selected" : ""); html += F(">GFS seamless</option>");
+  if (html.length() >= 3000) flush();
   html += F("<option value='icon_seamless'"); html += (modelSel == "icon_seamless" ? " selected" : ""); html += F(">ICON seamless</option>");
+  if (html.length() >= 3000) flush();
   html += F("<option value='ecmwf_ifs025'");  html += (modelSel == "ecmwf_ifs025" ? " selected" : ""); html += F(">ECMWF IFS 0.25</option>");
+  if (html.length() >= 3000) flush();
   html += F("<option value='meteofrance_seamless'"); html += (modelSel == "meteofrance_seamless" ? " selected" : ""); html += F(">Meteo-France seamless</option>");
+  if (html.length() >= 3000) flush();
   html += F("<option value='jma_seamless'");  html += (modelSel == "jma_seamless" ? " selected" : ""); html += F(">JMA seamless</option>");
+  if (html.length() >= 3000) flush();
   html += F("<option value='cma_grapes_global'"); html += (modelSel == "cma_grapes_global" ? " selected" : ""); html += F(">CMA GRAPES global</option>");
+  if (html.length() >= 3000) flush();
   html += F("<option value='gem_seamless'");  html += (modelSel == "gem_seamless" ? " selected" : ""); html += F(">GEM seamless</option>");
+  if (html.length() >= 3000) flush();
   html += F("<option value='bom_access_global'"); html += (modelSel == "bom_access_global" ? " selected" : ""); html += F(">bom_access_global</option>");
+  if (html.length() >= 3000) flush();
   html += F("<option value='ukmo_seamless'"); html += (modelSel == "ukmo_seamless" ? " selected" : ""); html += F(">UKMO seamless</option>");
+  if (html.length() >= 3000) flush();
   html += F("<option value='icon_global'");   html += (modelSel == "icon_global" ? " selected" : ""); html += F(">ICON global</option>");
+  if (html.length() >= 3000) flush();
   html += F("<option value='icon_eu'");       html += (modelSel == "icon_eu" ? " selected" : ""); html += F(">ICON EU</option>");
+  if (html.length() >= 3000) flush();
   html += F("<option value='custom'");        html += (!modelIsKnown ? " selected" : ""); html += F(">custom</option>");
+  if (html.length() >= 3000) flush();
   html += F("</select><small>Open-Meteo forecast model</small></div>");
   html += F("<div class='row'><label>Temp/Humidity Source</label><select class='in-med' name='climateSource'>");
   html += F("<option value='meteo'"); html += (climateSource == CLIMATE_OPEN_METEO ? " selected" : ""); html += F(">Open-Meteo</option>");
+  if (html.length() >= 3000) flush();
   html += F("<option value='aht20'"); html += (climateSource == CLIMATE_AHT20_I2C ? " selected" : ""); html += F(">AHT20/AHT21 on I2C</option>");
+  if (html.length() >= 3000) flush();
   html += F("<option value='dht22'"); html += (climateSource == CLIMATE_DHT22_GPIO ? " selected" : ""); html += F(">DHT22/AM2302 on GPIO</option>");
+  if (html.length() >= 3000) flush();
   html += F("</select><small>Local sensors supply current temperature/humidity. Smart Watering uses the selected Temperature Basis; forecast sources still use Open-Meteo.</small></div>");
   html += F("<div class='row'><label>Temperature Unit</label><select class='in-sm' name='tempUnit' id='tempUnitSelect'>");
   html += F("<option value='C'"); html += (!tempUseFahrenheit ? " selected" : ""); html += F(">Celsius (C)</option>");
+  if (html.length() >= 3000) flush();
   html += F("<option value='F'"); html += (tempUseFahrenheit ? " selected" : ""); html += F(">Fahrenheit (F)</option></select><small>Dashboard, screen, and Smart Watering thresholds</small></div>");
+  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>DHT22 GPIO</label><input class='in-xs' type='number' min='-1' max='");
   html += String(uiMaxGpio); html += F("' name='dhtSensorPin' value='"); html += String(dhtSensorPin);
+  if (html.length() >= 3000) flush();
   html += F("'><small>Use -1 when disconnected. AM2302 uses the same DHT22 setting.</small></div>");
   html += F("<div class='row' id='meteoModelCustomRow' style='display:");
   html += (modelIsKnown ? "none" : "flex");
+  if (html.length() >= 3000) flush();
   html += F("'><label>Custom Model</label><input class='in-med' type='text' name='meteoModelCustom' value='");
   html += (modelIsKnown ? "" : modelSel);
+  if (html.length() >= 3000) flush();
   html += F("'><small>Use an Open-Meteo models value, e.g. gfs_seamless</small></div>");
   html += F("<div class='row helptext'><label></label><small>No API key required. Enter your coordinates for Open-Meteo.</small></div>");
   html += F("</div></details></div>");
@@ -8296,6 +8370,7 @@ void handleSetupPage() {
   html += F("<label class='chip'>");
   html += F("<input type='radio' name='tzMode' value='0' ");
   html += (tzMode==TZ_POSIX ? "checked" : "");
+  if (html.length() >= 3000) flush();
   html += F(" id='tzModePosix'>");
   html += F("<span>POSIX string</span>");
   html += F("</label>");
@@ -8303,6 +8378,7 @@ void handleSetupPage() {
   html += F("<label class='chip'>");
   html += F("<input type='radio' name='tzMode' value='2' ");
   html += (tzMode==TZ_FIXED ? "checked" : "");
+  if (html.length() >= 3000) flush();
   html += F(">");
   html += F("<span>Fixed offset</span>");
   html += F("</label>");
@@ -8314,6 +8390,7 @@ void handleSetupPage() {
   html += F("<label>Timezone</label>");
   html += F("<input class='in-wide' type='text' name='tzPosix' value='");
   html += tzPosix;
+  if (html.length() >= 3000) flush();
   html += F("' placeholder='ACST-9:30ACDT,M10.1.0,M4.1.0/3'>");
   html += F("</div>");
 
@@ -8376,6 +8453,7 @@ void handleSetupPage() {
 
   html += F("<div class='row'><label>Fixed Offset (min)</label><input class='in-sm' type='number' name='tzFixed' value='");
   html += String(tzFixedOffsetMin);
+  if (html.length() >= 3000) flush();
   html += F("'><small>Minutes from UTC</small></div>");
   html += F("</div></details></div>"); // end Timezone card
 
@@ -8385,33 +8463,45 @@ void handleSetupPage() {
   html += F("<div class='row'><label>Display</label><select class='in-med' name='displayType' id='displayTypeSelect'>");
   html += F("<option value='none'");
   html += (!displayEnabled ? " selected" : "");
+  if (html.length() >= 3000) flush();
   html += F(">Disabled</option>");
   html += F("<option value='tft'");
   html += (displayEnabled && displayUseTft ? " selected" : "");
+  if (html.length() >= 3000) flush();
   html += F(">TFT (ST7789)</option>");
   html += F("<option value='oled'");
   html += (displayEnabled && !displayUseTft ? " selected" : "");
+  if (html.length() >= 3000) flush();
   html += F(">OLED (SSD1306)</option></select><small>Applied after reboot</small></div>");
   html += F("<div class='row'><label>Clock Format</label><select class='in-sm' name='clockFormat'>");
   html += F("<option value='24'");
   html += (clockUse24Hour ? " selected" : "");
+  if (html.length() >= 3000) flush();
   html += F(">24 hour</option>");
   html += F("<option value='12'");
   html += (!clockUse24Hour ? " selected" : "");
+  if (html.length() >= 3000) flush();
   html += F(">12 hour</option></select><small>Controls the clock shown on the screen</small></div>");
   html += F("<div class='row' data-tft-only><label>TFT Rotation</label><select class='in-sm' name='tftRotation'>");
   html += F("<option value='0'"); html += (tftRotation == 0 ? " selected" : ""); html += F(">0</option>");
+  if (html.length() >= 3000) flush();
   html += F("<option value='1'"); html += (tftRotation == 1 ? " selected" : ""); html += F(">1</option>");
+  if (html.length() >= 3000) flush();
   html += F("<option value='2'"); html += (tftRotation == 2 ? " selected" : ""); html += F(">2</option>");
+  if (html.length() >= 3000) flush();
   html += F("<option value='3'"); html += (tftRotation == 3 ? " selected" : ""); html += F(">3</option>");
+  if (html.length() >= 3000) flush();
   html += F("</select><small>ST7789 screen orientation (0-3)</small></div>");
   html += F("<div class='row' data-tft-only><label>TFT Size</label><div class='field'><input class='in-xs' type='number' min='120' max='400' name='tftWidth' value='");
   html += String(tftPanelWidth);
+  if (html.length() >= 3000) flush();
   html += F("'><span>x</span><input class='in-xs' type='number' min='120' max='400' name='tftHeight' value='");
   html += String(tftPanelHeight);
+  if (html.length() >= 3000) flush();
   html += F("'></div><small>Saved panel size. Common ST7789 sizes: 170x320, 240x320, 240x240. Applied after reboot.</small></div>");
   html += F("<div class='row switchline' data-tft-only><label>Auto Backlight (LDR)</label><input type='checkbox' name='photoAuto' ");
   html += (photoAutoEnabled ? "checked" : "");
+  if (html.length() >= 3000) flush();
   html += F("><small>Turn off TFT when it is dark</small></div>");
   if (tftBlPin < 0) {
     html += F("<div class='row helptext' data-tft-only><label></label><small>No BL pin set; will use display sleep (backlight stays on).</small></div>");
@@ -8424,17 +8514,21 @@ void handleSetupPage() {
   #if defined(CONFIG_IDF_TARGET_ESP32)
     html += F("<div class='row' data-tft-only><label>Photo GPIO</label><input class='in-xs' type='number' min='32' max='39' name='photoPin' value='");
     html += String(photoPin);
+  if (html.length() >= 3000) flush();
     html += F("'><small>ADC1 pin (ESP32: GPIO32-39)</small></div>");
   #else
     html += F("<div class='row' data-tft-only><label>Photo-Resistor GPIO</label><input class='in-xs' type='number' min='1' max='40' name='photoPin' value='");
     html += String(photoPin);
+  if (html.length() >= 3000) flush();
     html += F("'><small>ESP32-S3 photo input range: GPIO1-40</small></div>");
   #endif
   html += F("<div class='row' data-tft-only><label>Dark Threshold</label><input class='in-sm' type='number' min='0' max='4095' name='photoThreshold' value='");
   html += String(photoThreshold);
+  if (html.length() >= 3000) flush();
   html += F("'><small>ADC raw value where screen turns off</small></div>");
   html += F("<div class='row switchline' data-tft-only><label>Invert Sensor</label><input type='checkbox' name='photoInvert' ");
   html += (photoInvert ? "checked" : "");
+  if (html.length() >= 3000) flush();
   html += F("><small>Enable if your LDR reads higher when dark</small></div>");
   html += F("</div></details></div>");
 
@@ -8443,6 +8537,7 @@ void handleSetupPage() {
   html += F("<div class='card narrow' id='advanced-card' data-tft-only><details class='collapse'><summary>TFT Display Pins</summary><div class='collapse-body'><p class='card-intro'>Advanced TFT SPI and backlight pin mapping. These pins are only used when Display is set to TFT.</p>");
   html += F("<div class='row'><label>TFT Size</label><div class='chip'>");
   html += String(tftPanelWidth); html += "x"; html += String(tftPanelHeight);
+  if (html.length() >= 3000) flush();
   html += F("</div><small>Saved display geometry</small></div>");
   html += F("<datalist id='tftPins'>");
   for (int p = 1; p <= uiMaxGpio; ++p) {
@@ -8456,28 +8551,40 @@ void handleSetupPage() {
   html += F("</datalist>");
   html += F("<div class='row'><label>SCK</label><input class='in-xs' type='number' min='1' max='");
   html += String(uiMaxGpio);
+  if (html.length() >= 3000) flush();
   html += F("' list='tftPins' name='tftSclk' value='");
   html += String(tftSclkPin); html += F("'></div>");
+  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>MOSI</label><input class='in-xs' type='number' min='1' max='");
   html += String(uiMaxGpio);
+  if (html.length() >= 3000) flush();
   html += F("' list='tftPins' name='tftMosi' value='");
   html += String(tftMosiPin); html += F("'></div>");
+  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>CS</label><input class='in-xs' type='number' min='1' max='");
   html += String(uiMaxGpio);
+  if (html.length() >= 3000) flush();
   html += F("' list='tftPins' name='tftCs' value='");
   html += String(tftCsPin); html += F("'></div>");
+  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>DC</label><input class='in-xs' type='number' min='1' max='");
   html += String(uiMaxGpio);
+  if (html.length() >= 3000) flush();
   html += F("' list='tftPins' name='tftDc' value='");
   html += String(tftDcPin); html += F("'></div>");
+  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>RST</label><input class='in-xs' type='number' min='-1' max='");
   html += String(uiMaxGpio);
+  if (html.length() >= 3000) flush();
   html += F("' list='tftPinsOrNone' name='tftRst' value='");
   html += String(tftRstPin); html += F("'><small>-1 = not used</small></div>");
+  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>BL</label><input class='in-xs' type='number' min='-1' max='");
   html += String(uiMaxGpio);
+  if (html.length() >= 3000) flush();
   html += F("' list='tftPinsOrNone' name='tftBl' value='");
   html += String(tftBlPin); html += F("'><small>-1 = not used</small></div>");
+  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>LCD Brightness (%)</label><input class='in-xs' type='number' id='tftLevel' min='0' max='100' value='100'><button class='btn' type='button' id='btn-tft-bright'>Set</button></div>");
   html += F("<div class='row'><label>Self-Test</label><div class='field'>");
   html += F("<button class='btn-alt' type='button' id='tftSelfTestBtn'>TFT Self-Test</button>");
@@ -8489,6 +8596,7 @@ void handleSetupPage() {
   #else
     html += F("Use output-capable GPIO 1-");
     html += String(uiMaxGpio);
+  if (html.length() >= 3000) flush();
     html += F(" excluding 19/20 (USB), 0/45/46 (strapping), 9-14 & 35-38 (flash/PSRAM).");
   #endif
   html += F("</small></div>");
@@ -8499,8 +8607,10 @@ void handleSetupPage() {
   html += F("<div class='card narrow' id='i2c-card'><details class='collapse'><summary>I2C Relay Expander Pins</summary><div class='collapse-body'><p class='card-intro'>SDA and SCL for the PCF8574 relay expanders. Leave these alone unless your expander wiring is different.</p>");
   html += F("<div class='row'><label>SDA</label><input class='in-xs' type='number' min='0' max='48' name='i2cSda' value='");
   html += String(i2cSdaPin); html += F("'></div>");
+  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>SCL</label><input class='in-xs' type='number' min='0' max='48' name='i2cScl' value='");
   html += String(i2cSclPin); html += F("'></div>");
+  if (html.length() >= 3000) flush();
   html += F("<div class='row helptext'><label></label><small>Changing I2C pins requires reboot. Avoid strapping pins and SPI flash/PSRAM pins. KC868 boards commonly use SDA 4 and SCL 15.</small></div>");
   html += F("</div></details></div>");
 
@@ -8508,38 +8618,57 @@ void handleSetupPage() {
   html += F("<div class='card narrow' id='pins-card'><details class='collapse'><summary>Zones & Relay GPIO</summary><div class='collapse-body'><p class='card-intro'>Configure zone operation and assign direct ESP32 GPIO outputs for zone, city-water, tank, and power-supply relays.</p>");
   html += F("<div class='row'><label>Zone Count</label><input class='in-xs' type='number' min='1' max='");
   html += String(MAX_ZONES);
+  if (html.length() >= 3000) flush();
   html += F("' name='zonesMode' value='");
   html += String(zonesCount);
+  if (html.length() >= 3000) flush();
   html += F("'><small>Tank/Mains works with any zone count. Up to ");
   html += String(MAX_ZONES);
+  if (html.length() >= 3000) flush();
   html += F(" zones supported.</small></div>");
   html += F("<div class='row switchline'><label>Run Mode</label>");
   html += F("<label><input type='checkbox' name='runConcurrent' "); html += (runZonesConcurrent ? "checked" : "");
+  if (html.length() >= 3000) flush();
   html += F("> Run Zones Together</label><small>Unchecked = one at a time. Ensure the power supply can handle multiple valves before enabling concurrent operation.</small></div>");
   html += F("<div class='grid'>");
   for (uint8_t i=0;i<MAX_ZONES;i++){
     html += F("<div class='row switchline'><label>Zone "); html += String(i+1);
+  if (html.length() >= 3000) flush();
     html += F(" GPIO</label><input class='in-xs' type='number' min='-1' max='"); html += String(uiMaxGpio); html += F("' name='zonePin"); html += String(i);
+  if (html.length() >= 3000) flush();
     html += F("' value='"); html += String(zonePins[i]); html += F("'>");
+  if (html.length() >= 3000) flush();
     html += F("<label class='chip'><input type='checkbox' name='zonePinLow"); html += String(i); html += F("' ");
+  if (html.length() >= 3000) flush();
     html += (zoneGpioActiveLow[i] ? "checked" : "");
+  if (html.length() >= 3000) flush();
     html += F("><span>LOW = ON</span></label><small>-1 = unused</small></div>");
   }
   html += F("<div class='row helptext'><label></label><small>Use output-capable GPIOs only. Avoid boot strapping pins, flash pins, and any pins already used by display, I2C, sensors, or buttons.</small></div>");
   html += F("<div class='row switchline'><label>City Water Relay GPIO</label><input class='in-xs' type='number' min='-1' max='"); html += String(uiMaxGpio); html += F("' name='mainsPin' value='");
+  if (html.length() >= 3000) flush();
   html += String(mainsPin); html += F("'><label class='chip'><input type='checkbox' name='mainsPinLow' ");
+  if (html.length() >= 3000) flush();
   html += (mainsGpioActiveLow ? "checked" : "");
+  if (html.length() >= 3000) flush();
   html += F("><span>LOW = ON</span></label><small>-1 disables. City water relay. Use a check/backflow prevention device.</small></div>");
   html += F("<div class='row switchline'><label>Tank Relay GPIO</label><input class='in-xs' type='number' min='-1' max='"); html += String(uiMaxGpio); html += F("' name='tankPin' value='");
+  if (html.length() >= 3000) flush();
   html += String(tankPin); html += F("'><label class='chip'><input type='checkbox' name='tankPinLow' ");
+  if (html.length() >= 3000) flush();
   html += (tankGpioActiveLow ? "checked" : "");
+  if (html.length() >= 3000) flush();
   html += F("><span>LOW = ON</span></label><small>-1 disables. Tank pump/source relay output.</small></div>");
   html += F("<div class='row switchline'><label>Power Supply Relay GPIO</label><input class='in-xs' type='number' min='-1' max='"); html += String(uiMaxGpio); html += F("' name='powerSupplyPin' value='");
+  if (html.length() >= 3000) flush();
   html += String(powerSupplyPin); html += F("'><label class='chip'><input type='checkbox' name='powerSupplyPinLow' ");
+  if (html.length() >= 3000) flush();
   html += (powerSupplyActiveLow ? "checked" : "");
+  if (html.length() >= 3000) flush();
   html += F("><span>LOW = ON</span></label><small>-1 disables. Turns on while any zone or source relay is active.</small></div>");
   html += F("<div class='row'><label>Legacy Default</label><div class='chip'>");
   html += (gpioActiveLow ? "LOW = ON" : "HIGH = ON");
+  if (html.length() >= 3000) flush();
   html += F("</div><small>Used only when loading older saved configs that do not have per-pin polarity values yet.</small></div>");
 
   html += F("</div>");
@@ -8552,13 +8681,18 @@ void handleSetupPage() {
   // Manual buttons
   html += F("<div class='card narrow' id='buttons-card'><details class='collapse'><summary>Physical Button Pins</summary><div class='collapse-body'><p class='card-intro'>Optional input pins for local controls. Buttons use INPUT_PULLUP, so wire the button to pull the pin LOW when pressed.</p>");
   html += F("<div class='row switchline'><label>Select Button GPIO</label><input class='in-xs' type='number' min='-1' max='"); html += String(uiMaxGpio); html += F("' name='manualSelectPin' value='");
+  if (html.length() >= 3000) flush();
   html += String(manualSelectPin);
+  if (html.length() >= 3000) flush();
   html += F("'><small>-1 to disable. Uses INPUT_PULLUP; press = LOW.</small></div>");
   html += F("<div class='row switchline'><label>Start/Stop Button GPIO</label><input class='in-xs' type='number' min='-1' max='"); html += String(uiMaxGpio); html += F("' name='manualStartPin' value='");
+  if (html.length() >= 3000) flush();
   html += String(manualStartPin);
+  if (html.length() >= 3000) flush();
   html += F("'><small>Toggles the selected zone on/off.</small></div>");
   html += F("<div class='row'><label>Selected Zone</label><div class='sub'>");
   html += zoneNames[manualSelectedZone % zonesCount];
+  if (html.length() >= 3000) flush();
   html += F(" (cycles with Select button)</div></div>");
   html += F("</div></details></div>");
 
@@ -8570,41 +8704,59 @@ void handleSetupPage() {
   for (int i = 0; i < NO_WATER_PERIODS; ++i) {
     String key = String("noWater") + i;
     html += F("<fieldset><legend>Period "); html += i + 1; html += F("</legend><label><input type='checkbox' name='"); html += key + "Enabled";
+  if (html.length() >= 3000) flush();
     html += "'"; if (noWaterEnabled[i]) html += " checked"; html += F("> Enabled</label><div class='row'>");
+  if (html.length() >= 3000) flush();
     for (int d = 0; d < 7; ++d) {
       html += F("<label style='min-width:70px'><input type='checkbox' name='"); html += key + "Day" + d; html += "'";
+  if (html.length() >= 3000) flush();
       if (noWaterDays[i] & (1 << d)) html += " checked";
       html += "> "; html += noWaterDayNames[d]; html += "</label>";
+  if (html.length() >= 3000) flush();
     }
     char start[6], end[6];
     snprintf(start, sizeof(start), "%02d:%02d", noWaterStart[i] / 60, noWaterStart[i] % 60);
     snprintf(end, sizeof(end), "%02d:%02d", noWaterEnd[i] / 60, noWaterEnd[i] % 60);
     html += F("</div><div class='row'><label>Start <input type='time' required name='"); html += key + "Start"; html += "' value='"; html += start;
+  if (html.length() >= 3000) flush();
     html += F("'></label><label>End <input type='time' required name='"); html += key + "End"; html += "' value='"; html += end; html += F("'></label></div></fieldset>");
+  if (html.length() >= 3000) flush();
   }
   html += F("</div></details></div>");
   flush();
   // Custom styles for the embeddable schedule page
   html += F("<div class='card narrow' id='schedule-html-card'><details class='collapse'><summary>Schedule HTML Styles</summary><div class='collapse-body'><p class='card-intro'>Add CSS rules to customise the embeddable <code>/schedule-html</code> page. These rules are placed after the built-in styles in the page header.</p>");
   html += F("<div class='row'><label for='scheduleHtmlCss'>Custom CSS</label><textarea id='scheduleHtmlCss' name='scheduleHtmlCss' maxlength='4096' rows='10' spellcheck='false' placeholder='.schedule-heading { color: #2563eb; }'>");
-  html += htmlEscape(scheduleHtmlCustomCss);
+  // Escaping a 4 KB custom stylesheet can expand it to 24 KB.
+  for (size_t pos = 0; pos < scheduleHtmlCustomCss.length(); pos += 256) {
+    html += htmlEscape(scheduleHtmlCustomCss.substring(pos, pos + 256));
+    if (html.length() >= 3000) flush();
+  }
+  if (html.length() >= 3000) flush();
   html += F("</textarea><small>Up to 4096 characters. Leave blank to use only the built-in styles.</small></div></div></details></div>");
 
   flush();
   // MQTT
   html += F("<div class='card narrow' id='mqtt-card'><details class='collapse'><summary>MQTT Integration</summary><div class='collapse-body'><p class='card-intro'>Publish controller status and accept simple commands from Home Assistant or another MQTT client.</p>");
   html += F("<div class='row switchline'><label>Enable MQTT</label><input type='checkbox' name='mqttEnabled' "); html += (mqttEnabled ? "checked" : ""); html += F("></div>");
+  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>Broker Host</label><input class='in-wide' type='text' name='mqttBroker' value='"); html += mqttBroker; html += F("'></div>");
+  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>Port</label><input class='in-xs' type='number' name='mqttPort' value='"); html += String(mqttPort); html += F("'></div>");
+  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>User</label><input class='in-med' type='text' name='mqttUser' value='"); html += mqttUser; html += F("'></div>");
+  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>Password</label><input class='in-med' type='text' name='mqttPass' value='"); html += mqttPass; html += F("'></div>");
+  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>Base Topic</label><input class='in-med' type='text' name='mqttBase' value='"); html += mqttBase; html += F("'><small>e.g. espirrigation</small></div>");
+  if (html.length() >= 3000) flush();
   html += F("</div></details></div>");
 
 #if ENABLE_OTA
   html += F("<div class='card narrow' id='ota-card'><details class='collapse'><summary>Firmware Updates</summary><div class='collapse-body'><p class='card-intro'>Install a compiled application image directly from a browser, with ArduinoOTA retained as a second network update method.</p>");
   html += F("<div class='row'><label>Browser OTA</label><div class='sub'>");
   html += otaPassword.length() ? F("Password configured") : F("Disabled until a password is set");
+  if (html.length() >= 3000) flush();
   html += F("</div></div><div class='row'><label>OTA Username</label><div class='sub'><code>admin</code></div></div>");
   html += F("<div class='row'><label>New OTA Password</label><input class='in-med' type='password' name='otaPassword' minlength='8' maxlength='64' autocomplete='new-password' placeholder='Leave blank to keep current password'><small>8-64 characters. Used by both Browser OTA and ArduinoOTA. The current password is never displayed.</small></div>");
   html += F("<div class='row'><label>Upload Firmware</label><div><a class='btn-alt' href='/update'>Open Browser OTA</a><small>Save a new password before opening the uploader.</small></div></div>");
@@ -8617,10 +8769,12 @@ void handleSetupPage() {
   html += F("<script>");
   // Merge related sections without changing control names, IDs or form ownership.
   html += F("[['smart-card','Watering & Delays',['delays-card']],['tank-card','Water & Rain',['rain-card']],['weather-card','Forecast & Time',['timezone-card']],['pins-card','Hardware & Buttons',['i2c-card','buttons-card']],['display-card','Display & TFT Pins',['advanced-card']]].forEach(([id,title,children])=>{const parent=document.getElementById(id);if(!parent)return;parent.querySelector('summary').textContent=title;const body=parent.querySelector('.collapse-body');children.forEach(childId=>{const child=document.getElementById(childId);if(!child)return;const heading=document.createElement('h3');heading.textContent=child.querySelector('summary').textContent;const content=child.querySelector('.collapse-body');const section=document.createElement('section');section.id=childId;section.className='setup-merged';if(child.hasAttribute('data-tft-only'))section.setAttribute('data-tft-only','');section.append(heading);while(content.firstChild)section.append(content.firstChild);body.append(section);child.remove();document.querySelector('.setup-nav a[href=\\\"#'+childId+'\\\"]')?.remove();});const link=document.querySelector('.setup-nav a[href=\\\"#'+id+'\\\"]');if(link)link.textContent=title;});");
+  if (html.length() >= 3000) flush();
   html += F("function revealSetupSection(){const id=location.hash.slice(1);const target=document.getElementById(id);if(!target||!target.closest('#setupForm'))return;let node=target;while(node){if(node.tagName==='DETAILS')node.open=true;node=node.parentElement;}const details=target.querySelector('details');if(details)details.open=true;target.scrollIntoView({block:'start'});}document.querySelector('.setup-nav').addEventListener('click',event=>{const link=event.target.closest('a');if(!link)return;event.preventDefault();history.replaceState(null,'',link.hash);revealSetupSection();});window.addEventListener('hashchange',revealSetupSection);if(location.hash)revealSetupSection();");
   html += F("async function post(path, body){try{await fetch(path,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});}catch(e){console.error(e)}}");
   html += F("const g=id=>document.getElementById(id);");
   html += F("let setupTempUnit='"); html += temperatureUnitChar(); html += F("';const tempUnitSel=g('tempUnitSelect');");
+  if (html.length() >= 3000) flush();
   html += F("tempUnitSel?.addEventListener('change',()=>{const next=tempUnitSel.value==='F'?'F':'C';if(next===setupTempUnit)return;document.querySelectorAll('[data-smart-temp]').forEach(el=>{const v=parseFloat(el.value);if(Number.isFinite(v))el.value=(next==='F'?(v*9/5+32):(v-32)*5/9).toFixed(1);});document.querySelectorAll('[data-temp-unit]').forEach(el=>el.textContent=next);setupTempUnit=next;});");
   html += F(R"SMARTJS(
 (function(){
@@ -8645,6 +8799,7 @@ void handleSetupPage() {
   update();
 })();
 )SMARTJS");
+  if (html.length() >= 3000) flush();
   html += F("function addRipple(e){const t=e.currentTarget; if(t.disabled) return; const rect=t.getBoundingClientRect();");
   html += F("const size=Math.max(rect.width,rect.height); const x=(e.clientX|| (rect.left+rect.width/2)) - rect.left - size/2;");
   html += F("const y=(e.clientY|| (rect.top+rect.height/2)) - rect.top - size/2;");
@@ -8652,12 +8807,13 @@ void handleSetupPage() {
   html += F("r.style.left=x+'px'; r.style.top=y+'px'; const old=t.querySelector('.ripple'); if(old) old.remove(); t.appendChild(r);");
   html += F("setTimeout(()=>{r.remove();},520);}");
   html += F("document.querySelectorAll('.btn,.btn-alt').forEach(el=>{el.addEventListener('pointerdown',addRipple);});");
-  html += F("const savedFlag=sessionStorage.getItem('setupSaved');if(savedFlag){sessionStorage.removeItem('setupSaved');const c=g('save-confirm');if(c){c.classList.add('show');setTimeout(()=>c.classList.remove('show'),3500);}}");
-  html += F("g('setupForm')?.addEventListener('submit',()=>{sessionStorage.setItem('setupSaved','1');const b=g('btn-save-setup');if(b){b.textContent='Saving...';setTimeout(()=>{b.disabled=true;},0);}});");
+  html += F("const savedUrl=new URL(location.href);if(savedUrl.searchParams.get('saved')==='1'){savedUrl.searchParams.delete('saved');history.replaceState(null,'',savedUrl);const c=g('save-confirm');if(c){c.classList.add('show');setTimeout(()=>c.classList.remove('show'),3500);}}");
+  html += F("g('setupForm')?.addEventListener('submit',()=>{setupSaving=true;clearTimeout(setupStatusTimer);if(setupStatusController)setupStatusController.abort();const b=g('btn-save-setup');if(b){b.textContent='Saving...';setTimeout(()=>{b.disabled=true;},0);}});");
   html += F("g('btn-toggle-backlight')?.addEventListener('click',()=>post('/toggleBacklight','x=1'));");
   html += F("g('btn-clear-cooldown')?.addEventListener('click',async()=>{const b=g('btn-clear-cooldown');const old=b?b.textContent:'';if(b){b.disabled=true;b.textContent='Clearing...';}try{await post('/clear_cooldown','x=1');if(b)b.textContent='After-Rain Delay Cleared';setTimeout(()=>location.reload(),350);}catch(e){console.error(e);if(b){b.disabled=false;b.textContent='Clear Failed';setTimeout(()=>{b.textContent=old;},1500);}}});");
   html += F("g('btn-pause-24')?.addEventListener('click',()=>post('/pause','sec=86400'));");
   html += F("g('btn-pause-7d')?.addEventListener('click',()=>post('/pause','sec='+(7*86400)));");
+  if (html.length() >= 3000) flush();
   html += F("g('btn-resume')?.addEventListener('click',()=>post('/resume','x=1'));");
   html += F("g('btn-tft-bright')?.addEventListener('click',async()=>{const v=g('tftLevel'); if(!v) return; let n=parseInt(v.value||'100'); if(isNaN(n)) n=100; n=Math.min(100,Math.max(0,n)); v.value=n; try{await post('/tft_brightness','level='+n);}catch(e){console.error(e)}});");
   html += F("g('tftSelfTestBtn')?.addEventListener('click',async()=>{");
@@ -8669,9 +8825,30 @@ void handleSetupPage() {
   html += F("function syncDisplaySetup(){const isTft=displayTypeSel&&displayTypeSel.value==='tft';document.querySelectorAll('[data-tft-only]').forEach(el=>{el.style.display=isTft?'':'none';});}");
   html += F("displayTypeSel?.addEventListener('change',syncDisplaySetup);syncDisplaySetup();");
 
+  html += F(R"SETUPSTATUS(
+let setupSaving=false, setupStatusTimer=null, setupStatusRequest=null, setupStatusController=null;
+function fetchSetupStatus(){
+  if(setupSaving || document.hidden) return Promise.resolve(null);
+  if(setupStatusRequest) return setupStatusRequest;
+  setupStatusController=new AbortController();
+  const timeout=setTimeout(()=>setupStatusController?.abort(),8000);
+  setupStatusRequest=fetch('/status',{cache:'no-store',signal:setupStatusController.signal})
+    .then(r=>{if(!r.ok)throw Error('Status unavailable');return r.json();})
+    .finally(()=>{clearTimeout(timeout);setupStatusRequest=null;setupStatusController=null;});
+  return setupStatusRequest;
+}
+async function refreshSetupStatus(){
+  if(setupSaving) return;
+  await Promise.all([loadTftStatus(),loadMoistureStatus()]);
+  if(!setupSaving) setupStatusTimer=setTimeout(refreshSetupStatus,5000);
+}
+window.addEventListener('pagehide',()=>{setupSaving=true;clearTimeout(setupStatusTimer);setupStatusController?.abort();});
+window.addEventListener('pageshow',e=>{if(e.persisted){setupSaving=false;const b=g('btn-save-setup');if(b){b.disabled=false;b.textContent='Save Changes';}refreshSetupStatus();}});
+)SETUPSTATUS");
+  if (html.length() >= 3000) flush();
   html += F("async function loadTftStatus(){");
   html += F("  const el=g('tftStatusLine'); if(!el) return;");
-  html += F("  try{const r=await fetch('/status'); const st=await r.json();");
+  html += F("  try{const st=await fetchSetupStatus(); if(!st)return;");
   html += F("    const pin=st.tftBlPin; const pwm=!!st.tftPwm; const on=!!st.tftBlOn; const disp=!!st.tftDisplayOn;");
   html += F("    const pct=(typeof st.tftBrightnessPct==='number')?st.tftBrightnessPct:0;");
   html += F("    if(typeof pin==='number' && pin>=0){");
@@ -8684,7 +8861,7 @@ void handleSetupPage() {
   html += F("async function loadMoistureStatus(){");
   html += F("  const rawEl=g('moistureLiveRaw'); const pctEl=g('moistureLivePct'); const hint=g('moistureLiveHint');");
   html += F("  if(!rawEl&&!pctEl&&!hint) return;");
-  html += F("  try{const r=await fetch('/status'); const st=await r.json();");
+  html += F("  try{const st=await fetchSetupStatus(); if(!st)return;");
   html += F("    const en=!!st.moistureEnabled; const raw=(typeof st.moistureRaw==='number')?st.moistureRaw:-1; const pct=(typeof st.moisturePct==='number')?st.moisturePct:-1;");
   html += F("    if(rawEl) rawEl.textContent='Raw: '+(en&&raw>=0?raw:'--');");
   html += F("    if(pctEl) pctEl.textContent=(st.moistureSource==='meteo'?'Water volume: ':'Wet: ')+(en&&pct>=0?(Math.round(pct)+'%'):'--');");
@@ -8699,6 +8876,7 @@ void handleSetupPage() {
 
   // === Timezone loading from Nayarsystems posix_tz_db with fallback ===
   html += F("const TZ_DB_URL='https://raw.githubusercontent.com/nayarsystems/posix_tz_db/master/zones.json';");
+  if (html.length() >= 3000) flush();
   html += F("const tzInput=document.getElementsByName('tzIANA')[0]||null;");
   html += F("const tzPosixInput=document.getElementsByName('tzPosix')[0]||null;");
   html += F("const tzSel=g('tzIANASelect');");
@@ -8752,6 +8930,7 @@ void handleSetupPage() {
   // Helper to populate the select + sync inputs from a map of { IANA: POSIX }
   html += F("function buildTzOptions(zones){");
   html += F(" if(!tzSel||!tzInput) return;");
+  if (html.length() >= 3000) flush();
   html += F(" const current=tzInput.value||'';");
   html += F(" tzSel.innerHTML='<option value=\"\">Select from list</option>';");
 
@@ -8815,6 +8994,7 @@ void handleSetupPage() {
   html += F("function initThemeToggle(){");
   html += F("  let saved=localStorage.getItem('theme');");
   html += F("  if(saved!=='light'&&saved!=='dark'){saved=(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light';}");
+  if (html.length() >= 3000) flush();
   html += F("  document.documentElement.setAttribute('data-theme', saved);");
   html += F("  const cb=document.getElementById('themeToggle');");
   html += F("  if(cb){cb.checked=(saved==='dark');cb.addEventListener('change',()=>{");
@@ -8823,8 +9003,7 @@ void handleSetupPage() {
   html += F("}");
   html += F("initThemeToggle();");
   html += F("loadTimezones();");
-  html += F("loadTftStatus();");
-  html += F("loadMoistureStatus(); setInterval(loadMoistureStatus,3000);");
+  html += F("refreshSetupStatus();");
   // === END TZ CODE ===
 
   html += F("</script>");
@@ -10207,6 +10386,10 @@ void handleConfigure() {
 #endif
 
     // NEW: snapshot current values before applying POST changes
+  const TZMode oldTzMode = tzMode;
+  const String oldTzPosix = tzPosix;
+  const String oldTzIana = tzIANA;
+  const int16_t oldTzFixed = tzFixedOffsetMin;
   float  oldLat    = meteoLat;
   float  oldLon    = meteoLon;
   String oldLoc    = meteoLocation;
@@ -10700,7 +10883,8 @@ void handleConfigure() {
     localTempC = NAN;
     localHumidityPct = NAN;
   }
-  applyLocalClimateOverride(true);
+  // The next loop iteration refreshes local climate without delaying the save.
+  localClimateLastReadMs = 0;
   if (clockFormatChanged || tempUnitChanged || climateSourceChanged || dhtPinChanged) {
     g_forceHomeReset = true;
     lastScreenRefresh = 0;
@@ -10747,21 +10931,26 @@ void handleConfigure() {
     todaySunrise        = 0;
     todaySunset         = 0;
     clearRainHistoryState();
-    applyLocalClimateOverride(true);
+    // The next loop iteration refreshes local climate without delaying the save.
+    localClimateLastReadMs = 0;
   }
 
 
-  applyTimezoneAndSNTP();  // re-sync NTP with new TZ
+  if (oldTzMode != tzMode || oldTzPosix != tzPosix || oldTzIana != tzIANA || oldTzFixed != tzFixedOffsetMin) {
+    applyTimezoneAndSNTP(false);
+  }
   mqttSetup();             // reconfigure client; loop() will reconnect
 
-  server.sendHeader("Location", "/setup", true);
-  server.send(302, "text/plain", "");
-
   if (tftPinsChanged || tftGeometryChanged || i2cPinsChanged || displayModeChanged) {
+    // Do not redirect into a controller that is about to restart.
+    server.send(200, "text/html", "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><meta http-equiv='refresh' content='8;url=/setup?saved=1'><title>Settings saved</title></head><body><h1>Settings saved</h1><p>Restarting to apply display or pin changes. Setup will reopen shortly.</p><a href='/setup?saved=1'>Open Setup</a></body></html>");
     Serial.println("[CFG] Display/pin mapping changed, restarting to apply...");
     delay(200);
     ESP.restart();
+    return;
   }
+  server.sendHeader("Location", "/setup?saved=1", true);
+  server.send(303, "text/plain", "");
 }
 void handleClearEvents() {
   HttpScope _scope;

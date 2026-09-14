@@ -46,5 +46,6 @@ test('automatic start paths check periods before wind queueing',()=>{
   assert.ok(start.indexOf('noWaterPeriodActiveNow()')<start.indexOf('if (windBlocksZone(z))'));
   const due=extractFunction(source,'shouldStartZone');
   assert.ok(due.indexOf('lastCheckedMinute[zone] = mn')<due.indexOf('noWaterPeriodActiveNow()'));
-  assert.ok(extractFunction(source,'loop').includes('enforceNoWaterPeriod();'));
+  assert.ok(extractFunction(source,'loop').includes('tickIrrigationControl();'));
+  assert.ok(extractFunction(source,'tickIrrigationControl').includes('enforceNoWaterPeriod();'));
 });

@@ -38,6 +38,7 @@ test('zone wind preference is connected to both save paths and backward-compatib
   assert.match(extractFunction(source, 'loadSchedule'), /zoneWindDelayEnabled\[i\] = tok\(16, 1\) == 1/);
   assert.match(extractFunction(source, 'saveSchedule'), /f.print\(zoneWindDelayEnabled\[i\]/);
   assert.match(extractFunction(source, 'turnOnZone'), /if \(windBlocksZone\(z\)\)/);
-  const loop = extractFunction(source, 'loop');
+  assert.match(extractFunction(source, 'loop'), /tickIrrigationControl\(\);/);
+  const loop = extractFunction(source, 'tickIrrigationControl');
   assert.equal((loop.match(/pendingStart\[z\] && !windBlocksZone\(z\)/g) || []).length, 2);
 });
