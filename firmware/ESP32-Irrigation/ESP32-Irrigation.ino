@@ -57,7 +57,7 @@ extern "C" {
 // ---------- Hardware ----------
 static const char kFirmwareSignature[] __attribute__((used)) =
   "Original author: Beau Kaczmarek - https://github.com/numerik11/ESP32-Irrigation-Controller";
-static const char kFirmwareVersion[] = "3.2.3";
+static const char kFirmwareVersion[] = "3.2.4";
 static const char kFirmwareBuildDate[] = __DATE__ " " __TIME__;
 static const char kUpdateReportUrl[] =
   "https://irrigation-update-counter.beaukacz86.workers.dev/v1/report";
@@ -6263,6 +6263,10 @@ void HomeScreen() {
     int windDirRounded = isfinite(curWindDirDeg) ? (int)lroundf(normalizeDegrees360(curWindDirDeg)) : -1;
     int status = !systemMasterEnabled ? 3 : (isPausedNow() ? 2 : ((isRainDelayBlockingNow() || windActive) ? 1 : 0));
     bool fullRedraw = g_forceHomeReset || !portraitInit || lastW != W || lastH != H;
+    const bool roomyPortrait = W >= 240;
+    const bool nextMinuteChanged = curMinute != lastMinute;
+    const bool nextWaterChanged = fullRedraw || nextMinuteChanged ||
+                                  nw.zone != lastNextZone || nw.epoch != lastNextEpoch;
     const int side = 8;
     const int cardW = W - 2 * side;
     const int clockY = 8;
@@ -6320,11 +6324,11 @@ void HomeScreen() {
     }
     if (fullRedraw || curMinute != lastMinute || status != lastStatus) {
       tft.fillRect(16, clockY + 10, W - 32, clockH - 16, C_PANEL);
-      tft.setTextSize(3);
+      tft.setTextSize(roomyPortrait ? 4 : 3);
       tft.setTextColor(C_ACCENT);
       int16_t tx1, ty1; uint16_t tw, th;
       tft.getTextBounds(tbuf, 0, 0, &tx1, &ty1, &tw, &th);
-      tft.setCursor((W - (int)tw) / 2, clockY + 18);
+      tft.setCursor((W - (int)tw) / 2, clockY + (roomyPortrait ? 14 : 18));
       tft.print(tbuf);
       tft.setTextSize(1);
       tft.setTextColor(C_TEXT);
@@ -6345,7 +6349,7 @@ void HomeScreen() {
       lastStatus = status;
     }
 
-    if (fullRedraw || nw.zone != lastNextZone || nw.epoch != lastNextEpoch) {
+    if (!roomyPortrait && (fullRedraw || nw.zone != lastNextZone || nw.epoch != lastNextEpoch)) {
       tft.fillRect(16, nextY + 17, W - 32, nextH - 20, C_PANEL);
       tft.setTextSize(1);
       tft.setTextColor(C_TEXT);
@@ -6366,6 +6370,48 @@ void HomeScreen() {
       lastNextEpoch = nw.epoch;
     }
 
+    if (roomyPortrait && nextWaterChanged) {
+      // Keep the zone name beside the label and use the row below for time.
+      tft.fillRect(84, nextY + 5, W - 100, 10, C_PANEL);
+      tft.fillRect(16, nextY + 17, W - 32, nextH - 20, C_PANEL);
+      tft.setTextSize(1);
+      tft.setTextColor(C_MUTED);
+      if (nw.zone >= 0) {
+        String name = zoneNames[nw.zone];
+        const int maxChars = (W - 106) / 6;
+        if ((int)name.length() > maxChars) name = name.substring(0, maxChars - 3) + "...";
+        tft.setCursor(90, nextY + 6);
+        tft.print(name);
+      }
+      tft.setTextSize(2);
+      tft.setTextColor(C_ACCENT);
+      tft.setCursor(16, nextY + 21);
+      if (nw.zone >= 0) {
+        struct tm nextTime;
+        localtime_r(&nw.epoch, &nextTime);
+        char nextClock[8];
+        formatClockTime(nextTime, nextClock, sizeof(nextClock));
+        tft.print(nextClock);
+        const long minutes = max(0L, (long)difftime(nw.epoch, now) / 60L);
+        char countdown[24];
+        if (minutes >= 1440) snprintf(countdown, sizeof(countdown), "in %ldd %ldh", minutes / 1440, (minutes % 1440) / 60);
+        else if (minutes >= 60) snprintf(countdown, sizeof(countdown), "in %ldh %ldm", minutes / 60, minutes % 60);
+        else snprintf(countdown, sizeof(countdown), "in %ldm", minutes);
+        tft.setTextSize(1);
+        tft.setTextColor(C_TEXT);
+        tft.setCursor(W - 16 - strlen(countdown) * 6, nextY + 25);
+        tft.print(countdown);
+      } else {
+        tft.print("None");
+        tft.setTextSize(1);
+        tft.setTextColor(C_MUTED);
+        tft.setCursor(W - 82, nextY + 25);
+        tft.print("No schedule");
+      }
+      lastNextZone = nw.zone;
+      lastNextEpoch = nw.epoch;
+    }
+
     if (fullRedraw || pctClamped != lastPct || status != lastSystemStatus ||
         moisturePctHome != lastMoisturePct || (moistureSkipHome ? 1 : 0) != lastMoistureSkip) {
       const char* waterSrc = "";
@@ -6381,7 +6427,7 @@ void HomeScreen() {
       tft.print("TANK LEVEL");
       if (moistureProbeEnabled) {
         tft.setTextColor(moistureSkipHome ? C_WARN : C_MUTED);
-        tft.setCursor(91, tankY + 7);
+        tft.setCursor(roomyPortrait ? W - 70 : 91, tankY + 7);
         tft.print("Soil ");
         if (moisturePctHome >= 0) {
           tft.print(moisturePctHome);
@@ -6409,14 +6455,14 @@ void HomeScreen() {
 
       tft.setTextSize(1);
       tft.setTextColor(lowTank ? C_BAD : C_MUTED);
-      tft.setCursor(58, tankY + 47);
+      tft.setCursor(roomyPortrait ? 94 : 62, tankY + 47);
       if (!tankEnabled) tft.print("DISABLED");
       else if (lowTank) tft.print("LOW - MAINS");
       else if (pctClamped >= 80) tft.print("FULL");
       else tft.print("NORMAL");
 
       tft.setTextColor(C_MUTED);
-      tft.setCursor(58, tankY + 59);
+      tft.setCursor(roomyPortrait ? 94 : 62, tankY + 59);
       tft.print("Source ");
       tft.setTextColor(tankOn ? C_GOOD : (mainsOn ? C_WARN : C_TEXT));
       tft.print(waterSrc && waterSrc[0] ? waterSrc : "--");

@@ -318,3 +318,7 @@ The weather summary replaces Sunrise and Sunset with Day Length and Daily Change
 ## Version 3.2.3
 
 Setup, Events, Diagnostics, firmware upload, schedule and tank calibration pages now stream through a fixed 2 KB buffer, including individual event rows. Weather no longer preallocates 20 KB of raw JSON storage or retains a raw forecast cache. Completed worker payloads are released after their results are applied. These changes reduce memory pressure on classic ESP32 boards without PSRAM. Both updater images include the fix; flash partition layouts are unchanged.
+
+## Version 3.2.4
+
+The 240x320 portrait TFT home screen now uses a larger clock and next-watering time, shows the next zone name with a countdown refreshed every minute, and spreads tank status, water source and soil readings across the available width. Long zone names are shortened to fit. Both ESP32 and ESP32-S3 updater images include the layout update.
