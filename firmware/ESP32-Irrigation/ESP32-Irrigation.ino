@@ -57,7 +57,7 @@ extern "C" {
 // ---------- Hardware ----------
 static const char kFirmwareSignature[] __attribute__((used)) =
   "Original author: Beau Kaczmarek - https://github.com/numerik11/ESP32-Irrigation-Controller";
-static const char kFirmwareVersion[] = "3.2";
+static const char kFirmwareVersion[] = "3.2.1";
 static const char kFirmwareBuildDate[] = __DATE__ " " __TIME__;
 static const char kUpdateReportUrl[] =
   "https://irrigation-update-counter.beaukacz86.workers.dev/v1/report";
@@ -6723,6 +6723,46 @@ static NextWaterInfo computeNextWatering() {
 }
 
 // Main Page
+// Bound the complete response, including scripts and dynamic zone cards.
+// ESP32 flash strings are memory-mapped, so they can be copied in small slices.
+class HttpHtmlBuffer {
+ public:
+  static constexpr size_t kCapacity = 2048;
+  explicit HttpHtmlBuffer(WebServer& server) : server_(server), buffer_(static_cast<char*>(malloc(kCapacity))) {}
+  ~HttpHtmlBuffer() { free(buffer_); }
+  HttpHtmlBuffer(const HttpHtmlBuffer&) = delete;
+  HttpHtmlBuffer& operator=(const HttpHtmlBuffer&) = delete;
+  bool ready() const { return buffer_ != nullptr; }
+  HttpHtmlBuffer& operator+=(const String& value) { append(value.c_str(), value.length()); return *this; }
+  HttpHtmlBuffer& operator+=(const char* value) { if (value) append(value, strlen(value)); return *this; }
+  HttpHtmlBuffer& operator+=(const __FlashStringHelper* value) { return *this += reinterpret_cast<const char*>(value); }
+  HttpHtmlBuffer& operator+=(char value) { append(&value, 1); return *this; }
+  void flush() {
+    if (!used_ || failed_) return;
+    if (!server_.client().connected()) { failed_ = true; used_ = 0; return; }
+    server_.sendContent(buffer_, used_);
+    used_ = 0;
+    delay(0);
+  }
+
+ private:
+  void append(const char* data, size_t length) {
+    if (!buffer_ || failed_) return;
+    size_t offset = 0;
+    while (offset < length && !failed_) {
+      const size_t count = min(length - offset, kCapacity - used_);
+      memcpy(buffer_ + used_, data + offset, count);
+      used_ += count;
+      offset += count;
+      if (used_ == kCapacity) flush();
+    }
+  }
+  WebServer& server_;
+  char* buffer_;
+  size_t used_ = 0;
+  bool failed_ = false;
+};
+
 void handleRoot() {
   HttpScope _scope;  // NEW: mark that we're in an HTTP handler so no blocking fetches
 
@@ -6820,16 +6860,14 @@ void handleRoot() {
   String heroWeatherValue = isnan(temp) ? String("--") : String(temp, 1) + " " + temperatureUnitChar();
 
   // --- HTML ---
-  // Each streamed stylesheet segment stays below this preallocated capacity.
-  String html; html.reserve(7000);
+  HttpHtmlBuffer html(server);
+  if (!html.ready()) {
+    server.send(503, "text/plain", "Not enough memory to open Home. Please retry.");
+    return;
+  }
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/html", "");
-  auto flush = [&](){
-    if (html.length()) {
-      server.sendContent(html);
-      html = "";
-    }
-  };
+  auto flush = [&](){ html.flush(); };
   html += F("<!doctype html><html lang='en' data-theme='light'><head>");
   html += F("<meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>");
   html += F("<meta name='theme-color' content='#1e40af'><meta name='color-scheme' content='light dark'>");
@@ -7587,9 +7625,10 @@ void handleRoot() {
   html += F("function setWeatherIcon(text){const el=document.getElementById('condIcon');if(!el)return;el.className='weather-icon '+weatherIconClass(text);el.title=text||'Unknown';}");
   html += F("function wifiQuality(v,c){if(c===false)return'Disconnected';if(typeof v!=='number')return'Connected';if(v>=-50)return'Excellent';if(v>=-60)return'Strong';if(v>=-67)return'Good';if(v>=-75)return'Fair';if(v>=-82)return'Weak';return'Very weak';}");
   html += F("function updateWifiSummary(st){const rssi=document.getElementById('rssiChip');const rq=document.getElementById('rssiQuality');const connected=(typeof st.wifiConnected==='boolean')?st.wifiConnected:undefined;const v=(typeof st.rssi==='number')?st.rssi:null;if(rssi)rssi.textContent=(v===null?'--':v)+' dBm';if(rq)rq.textContent=wifiQuality(v,connected);}");
-  html += F("async function refreshWifiStatus(){try{const r=await fetch('/status',{cache:'no-store'});updateWifiSummary(await r.json());}catch(e){}}");
-  html += F("async function refreshStatus(){try{const r=await fetch('/status',{cache:'no-store'});const st=await r.json();");
-  html += F("if(!_wifiSeeded){updateWifiSummary(st);_wifiSeeded=true;}");
+
+  html += F("let homeStatusBusy=false,homeStatusTimer=null,homeStatusController=null,homeStatusPaused=false;");
+  html += F("async function refreshStatus(){if(homeStatusPaused||homeStatusBusy)return;clearTimeout(homeStatusTimer);if(document.hidden){homeStatusTimer=setTimeout(refreshStatus,2000);return;}homeStatusBusy=true;homeStatusController=new AbortController();const timeout=setTimeout(()=>homeStatusController?.abort(),8000);try{const r=await fetch('/status',{cache:'no-store',signal:homeStatusController.signal});if(!r.ok)throw Error('Status unavailable');const st=await r.json();");
+  html += F("updateWifiSummary(st);");
   html += F("if(typeof st.deviceEpoch==='number' && st.deviceEpoch>0 && _devEpoch===null){ startDeviceClock(st.deviceEpoch); }");
   html += F("const rb=document.getElementById('rainBadge');const wb=document.getElementById('windBadge');");
   html += F("if(rb){const rc=st.rainDelayCause||'Active';rb.className='badge '+(st.rainDelayActive?'b-bad':'b-ok');rb.innerHTML='Rain: <b>'+(st.rainDelayActive?rc:'Off')+'</b>';}");
@@ -7696,7 +7735,7 @@ void handleRoot() {
   html += F("if(hs) hs.textContent=masterOff?'Automation blocked':(epoch?(name+(dur>0?(' - '+fmtDur(dur)):'')):(st.rainDelayActive?'Waiting for rain delay to clear':'No queued run'));");
   html += F("})();");
 
-  html += F("}catch(e){} } setInterval(refreshStatus,1000); refreshStatus(); setInterval(refreshWifiStatus,60000);");
+  html += F("}catch(e){}finally{clearTimeout(timeout);homeStatusBusy=false;homeStatusController=null;if(!homeStatusPaused)homeStatusTimer=setTimeout(refreshStatus,2000);} } window.addEventListener('pagehide',()=>{homeStatusPaused=true;clearTimeout(homeStatusTimer);homeStatusController?.abort();});window.addEventListener('pageshow',e=>{if(e.persisted){homeStatusPaused=false;refreshStatus();}});refreshStatus();");
 
   // expose zonesCount & Save All
   html += F("const ZC="); html += String(zonesCount); html += F(";");

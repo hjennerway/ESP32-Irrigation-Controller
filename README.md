@@ -306,3 +306,7 @@ The main loop checks valve expiry and watering restrictions before HTTP work and
 ## Version 3.2
 
 The Current Weather summary shows Forecasted Rain between Condition and Wind Direction. It displays the next 24 hours of predicted rainfall in millimetres, updates with live status, and shows -- until a forecast is available.
+
+## Version 3.2.1
+
+Home streams its complete response, including JavaScript and zone cards, through a fixed 2 KB buffer. This removes the large contiguous allocations that could leave the page incomplete on an ESP32. Live status requests no longer overlap, have an eight-second timeout, and pause during navigation or while the tab is hidden.
