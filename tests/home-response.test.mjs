@@ -54,7 +54,7 @@ test('Home streaming stops on disconnect and tolerates allocation failure', () =
 
 const root = source.slice(source.indexOf('void handleRoot() {'), source.indexOf('void handleSetupPage() {'));
 const scriptSource = root.slice(root.indexOf('// --- JS ---'));
-const html = [...scriptSource.matchAll(/html \+= F\(("(?:[^"\\]|\\.)*")\);/g)].map(m => JSON.parse(m[1])).join('');
+const html = [...scriptSource.matchAll(/html \+= F\(("(?:[^"\\]|\\.)*"|R"(\w+)\(([\s\S]*?)\)\2")\);/g)].map(m => m[2] ? m[3] : JSON.parse(m[1])).join('');
 const javascript = html.split('<script>')[1].split('</script>')[0].replace('const ZC=;', 'const ZC=16;');
 
 test('The complete generated Home script parses', () => {

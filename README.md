@@ -310,3 +310,7 @@ The Current Weather summary shows Forecasted Rain between Condition and Wind Dir
 ## Version 3.2.1
 
 Home streams its complete response, including JavaScript and zone cards, through a fixed 2 KB buffer. This removes the large contiguous allocations that could leave the page incomplete on an ESP32. Live status requests no longer overlap, have an eight-second timeout, and pause during navigation or while the tab is hidden.
+
+## Version 3.2.2
+
+The weather summary replaces Sunrise and Sunset with Day Length and Daily Change compared with yesterday. Daylight comes from Open-Meteo daily daylight duration; yesterday is included in daily data while the hourly rain forecast stays at 24 future entries. Daily temperature and solar values are selected by date. Missing or stale daylight data is shown as --.

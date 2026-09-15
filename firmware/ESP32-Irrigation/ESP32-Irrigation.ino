@@ -57,7 +57,7 @@ extern "C" {
 // ---------- Hardware ----------
 static const char kFirmwareSignature[] __attribute__((used)) =
   "Original author: Beau Kaczmarek - https://github.com/numerik11/ESP32-Irrigation-Controller";
-static const char kFirmwareVersion[] = "3.2.1";
+static const char kFirmwareVersion[] = "3.2.2";
 static const char kFirmwareBuildDate[] = __DATE__ " " __TIME__;
 static const char kUpdateReportUrl[] =
   "https://irrigation-update-counter.beaukacz86.workers.dev/v1/report";
@@ -373,6 +373,9 @@ int   nextRainIn_h   = -1;
 float maxGust24h_ms  = NAN;
 float todayMin_C     = NAN, todayMax_C = NAN;
 time_t todaySunrise  = 0,   todaySunset = 0;
+float daylightSeconds = NAN, daylightChangeSeconds = NAN;
+char daylightDate[11] = "";
+int32_t daylightUtcOffsetSec = 0;
 
 // Delay controls
 bool  rainDelayEnabled = true;
@@ -1662,6 +1665,27 @@ static void drawWeatherIcon(int x, int y, int s, int code, uint16_t bg) {
     tft.drawCircle(x + s / 2, y + s / 2, s / 3, C_EDGE);
     tft.drawFastHLine(x + s / 3, y + s / 2, s / 3, C_MUTED);
   }
+}
+
+// Daily forecasts can include yesterday; select today using the current hourly date.
+static int forecastDayIndex(JsonArray dates, const char* currentHour) {
+  if (!currentHour || strlen(currentHour) < 10) return -1;
+  for (size_t i = 0; i < dates.size(); ++i) {
+    const char* date = dates[i].as<const char*>();
+    if (date && strlen(date) == 10 && strncmp(date, currentHour, 10) == 0) return (int)i;
+  }
+  return -1;
+}
+
+static bool daylightIsCurrent() {
+  time_t now = time(nullptr);
+  if (now < 1609459200 || !daylightDate[0]) return false;
+  now += daylightUtcOffsetSec;
+  struct tm local;
+  if (!gmtime_r(&now, &local)) return false;
+  char date[11];
+  strftime(date, sizeof(date), "%Y-%m-%d", &local);
+  return strcmp(date, daylightDate) == 0;
 }
 
 static time_t parseLocalIsoTime(const char* s) {
@@ -3450,6 +3474,11 @@ void setup() {
     doc["tmax"]        = isnan(todayMax_C) ? 0.0f : todayMax_C;
     doc["sunrise"]     = (uint32_t)todaySunrise;
     doc["sunset"]      = (uint32_t)todaySunset;
+    const bool daylightCurrent = daylightIsCurrent();
+    if (daylightCurrent && isfinite(daylightSeconds)) doc["daylightSeconds"] = daylightSeconds;
+    else doc["daylightSeconds"] = nullptr;
+    if (daylightCurrent && isfinite(daylightChangeSeconds)) doc["daylightChangeSeconds"] = daylightChangeSeconds;
+    else doc["daylightChangeSeconds"] = nullptr;
 
     // local vs UTC offset
     time_t nowEpoch = time(nullptr);
@@ -4500,8 +4529,8 @@ String fetchForecast(WeatherJob& job) {
     String url = meteoBaseUrl(model, useSelectedModel);
     url += "?latitude=" + String(lat,6) + "&longitude=" + String(lon,6);
     url += "&hourly=precipitation,precipitation_probability,wind_gusts_10m"
-           "&daily=temperature_2m_min,temperature_2m_max,sunrise,sunset"
-           "&forecast_hours=24&forecast_days=2";
+           "&daily=temperature_2m_min,temperature_2m_max,sunrise,sunset,daylight_duration"
+           "&forecast_hours=24&past_hours=0&past_days=1&forecast_days=2";
     if (useSelectedModel && model != "best_match") url += "&models=" + model;
     url += "&temperature_unit=celsius&wind_speed_unit=ms&precipitation_unit=mm&pressure_unit=hPa&timezone=auto";
     return url;
@@ -4793,6 +4822,9 @@ void updateCachedWeather() {
       maxGust24h_ms  = 0; 
       todaySunrise   = 0;   
       todaySunset    = 0;
+      daylightSeconds = NAN;
+      daylightChangeSeconds = NAN;
+      daylightDate[0] = '\0';
 
       JsonDocument fc;
       if (deserializeJson(fc, cachedForecastData) == DeserializationError::Ok) {
@@ -4802,10 +4834,22 @@ void updateCachedWeather() {
         JsonArray tmin = daily["temperature_2m_min"].as<JsonArray>();
         JsonArray tmax = daily["temperature_2m_max"].as<JsonArray>();
 
-        if (sunr.size() > 0) todaySunrise = parseLocalIsoTime(sunr[0] | "");
-        if (suns.size() > 0) todaySunset  = parseLocalIsoTime(suns[0] | "");
-        if (tmin.size() > 0) todayMin_C   = tmin[0] | todayMin_C;
-        if (tmax.size() > 0) todayMax_C   = tmax[0] | todayMax_C;
+        const int day = forecastDayIndex(daily["time"].as<JsonArray>(), fc["hourly"]["time"][0] | "");
+        if (day >= 0) {
+          if (sunr.size() > (size_t)day) todaySunrise = parseLocalIsoTime(sunr[day] | "");
+          if (suns.size() > (size_t)day) todaySunset = parseLocalIsoTime(suns[day] | "");
+          if (tmin.size() > (size_t)day) todayMin_C = tmin[day] | todayMin_C;
+          if (tmax.size() > (size_t)day) todayMax_C = tmax[day] | todayMax_C;
+          JsonArray lengths = daily["daylight_duration"].as<JsonArray>();
+          const float current = lengths[day] | NAN;
+          const float previous = day > 0 ? (lengths[day - 1] | NAN) : NAN;
+          if (isfinite(current) && current >= 0 && current <= 86400) {
+            daylightSeconds = current;
+            if (isfinite(previous) && previous >= 0 && previous <= 86400) daylightChangeSeconds = current - previous;
+            snprintf(daylightDate, sizeof(daylightDate), "%.10s", daily["time"][day].as<const char*>());
+            daylightUtcOffsetSec = fc["utc_offset_seconds"] | 0;
+          }
+        }
 
         JsonObject hourly = fc["hourly"].as<JsonObject>();
         JsonArray prec = hourly["precipitation"].as<JsonArray>();
@@ -7316,8 +7360,8 @@ void handleRoot() {
   html += F("<div class='metric-split-item'><div class='metric-v'><span id='tmax'>---</span><span class='metric-unit'>"); html += temperatureUnitChar(); html += F("</span></div></div>");
   html += F("</div></div>");
   html += F("<div class='metric-tile'><span class='metric-k'>Pressure</span><div class='metric-v pressure-value'><span><span id='press'>--</span><span class='metric-unit'>hPa</span></span><span id='pressTrend' class='pressure-trend' aria-label='Pressure trend'></span></div></div>");
-  html += F("<div class='metric-tile'><span class='metric-k'>Sunrise</span><div class='metric-v' id='sunr'>--:--</div></div>");
-  html += F("<div class='metric-tile'><span class='metric-k'>Sunset</span><div class='metric-v' id='suns'>--:--</div></div></div></div>");
+  html += F("<div class='metric-tile'><span class='metric-k'>Day Length</span><div class='metric-v' id='dayLength'>--</div><span class='metric-k'>Today</span></div>");
+  html += F("<div class='metric-tile'><span class='metric-k'>Daily Change</span><div class='metric-v' id='daylightChange'>--</div><span class='metric-k' id='daylightChangeHint'>Compared with yesterday</span></div></div></div>");
 
   // Delays + Next Water
   html += F("<div class='card summary-card next-card'><h3><span class='summary-heading-icon' aria-hidden='true'>&#9201;</span><span class='summary-heading-copy'><span class='summary-heading-k'>Automation outlook</span>Delays & Next Water</span></h3><div class='summary-meta status-pills'>");
@@ -7626,6 +7670,21 @@ void handleRoot() {
   html += F("function wifiQuality(v,c){if(c===false)return'Disconnected';if(typeof v!=='number')return'Connected';if(v>=-50)return'Excellent';if(v>=-60)return'Strong';if(v>=-67)return'Good';if(v>=-75)return'Fair';if(v>=-82)return'Weak';return'Very weak';}");
   html += F("function updateWifiSummary(st){const rssi=document.getElementById('rssiChip');const rq=document.getElementById('rssiQuality');const connected=(typeof st.wifiConnected==='boolean')?st.wifiConnected:undefined;const v=(typeof st.rssi==='number')?st.rssi:null;if(rssi)rssi.textContent=(v===null?'--':v)+' dBm';if(rq)rq.textContent=wifiQuality(v,connected);}");
 
+  html += F(R"DAYLIGHTJS(
+function updateDaylightCards(st){
+  const length=document.getElementById('dayLength');
+  const change=document.getElementById('daylightChange');
+  const hint=document.getElementById('daylightChangeHint');
+  const valid=typeof st.daylightSeconds==='number'&&Number.isFinite(st.daylightSeconds)&&st.daylightSeconds>=0;
+  const minutes=valid?Math.round(st.daylightSeconds/60):0;
+  if(length)length.textContent=valid?Math.floor(minutes/60)+'h '+String(minutes%60).padStart(2,'0')+'m':'--';
+  const delta=st.daylightChangeSeconds;
+  const known=valid&&typeof delta==='number'&&Number.isFinite(delta);
+  const seconds=known?Math.round(Math.abs(delta)):0;
+  if(change)change.textContent=known?(seconds===0?'No change':(delta>0?'+':'-')+Math.floor(seconds/60)+'m '+String(seconds%60).padStart(2,'0')+'s'):'--';
+  if(hint)hint.textContent=known?(seconds===0?'Same as yesterday':(delta>0?'Longer':'Shorter')+' than yesterday'):'Compared with yesterday';
+}
+)DAYLIGHTJS");
   html += F("let homeStatusBusy=false,homeStatusTimer=null,homeStatusController=null,homeStatusPaused=false;");
   html += F("async function refreshStatus(){if(homeStatusPaused||homeStatusBusy)return;clearTimeout(homeStatusTimer);if(document.hidden){homeStatusTimer=setTimeout(refreshStatus,2000);return;}homeStatusBusy=true;homeStatusController=new AbortController();const timeout=setTimeout(()=>homeStatusController?.abort(),8000);try{const r=await fetch('/status',{cache:'no-store',signal:homeStatusController.signal});if(!r.ok)throw Error('Status unavailable');const st=await r.json();");
   html += F("updateWifiSummary(st);");
@@ -7676,11 +7735,10 @@ void handleRoot() {
 
   // Weather stats
   html += F("const tempUnit=(st.tempUnit==='F')?'F':'C'; const showTemp=v=>(tempUnit==='F'?(v*9/5+32):v);");
-  html += F("const tmin=document.getElementById('tmin'); const tmax=document.getElementById('tmax'); const sunr=document.getElementById('sunr'); const suns=document.getElementById('suns'); const press=document.getElementById('press'); const pressTrend=document.getElementById('pressTrend');");
+  html += F("const tmin=document.getElementById('tmin'); const tmax=document.getElementById('tmax'); const press=document.getElementById('press'); const pressTrend=document.getElementById('pressTrend');");
   html += F("if(tmin) tmin.textContent=showTemp(st.tmin??0).toFixed(0);");
   html += F("if(tmax) tmax.textContent=showTemp(st.tmax??0).toFixed(0);");
-  html += F("if(sunr) sunr.textContent = st.sunriseLocal || '--:--';");
-  html += F("if(suns) suns.textContent = st.sunsetLocal  || '--:--';");
+  html += F("updateDaylightCards(st);");
   html += F("if(press){ const p=st.pressure; press.textContent=(typeof p==='number' && p>0)?p.toFixed(0):'--'; }");
   html += F("if(pressTrend){ const pt=(typeof st.pressureTrend==='number')?st.pressureTrend:0; pressTrend.textContent=pt>0?'\\u2191':(pt<0?'\\u2193':''); pressTrend.className='pressure-trend '+(pt>0?'up':(pt<0?'down':'')); pressTrend.title=pt>0?'Pressure rising':(pt<0?'Pressure falling':''); }");
   html += F("const tempEl=document.getElementById('tempChip'); const trendEl=document.getElementById('tempTrend');");
@@ -10976,6 +11034,9 @@ void handleConfigure() {
     todayMax_C          = NAN;
     todaySunrise        = 0;
     todaySunset         = 0;
+    daylightSeconds = NAN;
+    daylightChangeSeconds = NAN;
+    daylightDate[0] = '\0';
     clearRainHistoryState();
     // The next loop iteration refreshes local climate without delaying the save.
     localClimateLastReadMs = 0;
