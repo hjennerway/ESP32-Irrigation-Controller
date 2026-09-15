@@ -4,7 +4,7 @@ import vm from 'node:vm';
 import test from 'node:test';
 import { compileFirmwareFunctions } from './helpers/firmware-source.mjs';
 
-const source = await readFile(new URL('../firmware/ESP32-Irrigation/ESP32-Irrigation.ino', import.meta.url), 'utf8');
+const source = (await readFile(new URL('../firmware/ESP32-Irrigation/ESP32-Irrigation.ino', import.meta.url), 'utf8')).replace(/\r\n/g, '\n');
 const bufferSource = source.slice(source.indexOf('class HttpHtmlBuffer'), source.indexOf('void handleRoot() {'));
 
 function writer(allocated = true) {
@@ -52,14 +52,25 @@ test('Home streaming stops on disconnect and tolerates allocation failure', () =
   assert.equal(failed.chunks.length, 0);
 });
 
-for (const name of ['handleSetupPage', 'handleLogPage', 'handleDiagnosticsPage', 'handleOtaUpdatePage', 'handleScheduleHtml', 'handleTankCalibration']) {
+for (const [name, endMarker] of [
+  ['handleSetupPage', '// ---------- Schedule POST'],
+  ['handleLogPage', 'void handleTankCalibration() {'],
+  ['handleDiagnosticsPage', '#if ENABLE_OTA'],
+  ['handleOtaUpdatePage', 'static void handleOtaUploadData() {'],
+  ['handleScheduleHtml', 'static String compactRunDetailText('],
+  ['handleTankCalibration', 'static String _safeReadLine('],
+]) {
   test(`${name} static HTML and scripts survive 2 KB streaming boundaries`, () => {
     const start = source.indexOf(`void ${name}() {`);
-    const body = source.slice(start, source.indexOf('\n}\n', start));
+    const end = source.indexOf(endMarker, start);
+    assert.ok(start >= 0 && end > start);
+    const body = source.slice(start, end);
     const parts = [...body.matchAll(/html \+= F\(("(?:[^"\\]|\\.)*"|R"(\w+)\(([\s\S]*?)\)\2")\);/g)]
       .map(m => Buffer.from(m[2] ? m[3] : JSON.parse(m[1])));
+    assert.ok(parts.length > 0);
+    // Start near a boundary so even the small schedule page crosses a chunk.
+    parts.unshift(Buffer.alloc(2047, 32));
     const expected = Buffer.concat(parts);
-    assert.ok(expected.length > 2048);
     const w = writer();
     for (const part of parts) w.append(part, part.length);
     w.flush();
