@@ -52,6 +52,23 @@ test('Home streaming stops on disconnect and tolerates allocation failure', () =
   assert.equal(failed.chunks.length, 0);
 });
 
+for (const name of ['handleSetupPage', 'handleLogPage', 'handleDiagnosticsPage', 'handleOtaUpdatePage', 'handleScheduleHtml', 'handleTankCalibration']) {
+  test(`${name} static HTML and scripts survive 2 KB streaming boundaries`, () => {
+    const start = source.indexOf(`void ${name}() {`);
+    const body = source.slice(start, source.indexOf('\n}\n', start));
+    const parts = [...body.matchAll(/html \+= F\(("(?:[^"\\]|\\.)*"|R"(\w+)\(([\s\S]*?)\)\2")\);/g)]
+      .map(m => Buffer.from(m[2] ? m[3] : JSON.parse(m[1])));
+    const expected = Buffer.concat(parts);
+    assert.ok(expected.length > 2048);
+    const w = writer();
+    for (const part of parts) w.append(part, part.length);
+    w.flush();
+    assert.deepEqual(Buffer.concat(w.chunks), expected);
+    assert.ok(w.chunks.every(chunk => chunk.length <= 2048));
+    assert.match(expected.toString(), /<\/html>/);
+  });
+}
+
 const root = source.slice(source.indexOf('void handleRoot() {'), source.indexOf('void handleSetupPage() {'));
 const scriptSource = root.slice(root.indexOf('// --- JS ---'));
 const html = [...scriptSource.matchAll(/html \+= F\(("(?:[^"\\]|\\.)*"|R"(\w+)\(([\s\S]*?)\)\2")\);/g)].map(m => m[2] ? m[3] : JSON.parse(m[1])).join('');

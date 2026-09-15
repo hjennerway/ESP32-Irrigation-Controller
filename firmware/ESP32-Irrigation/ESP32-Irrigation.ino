@@ -57,7 +57,7 @@ extern "C" {
 // ---------- Hardware ----------
 static const char kFirmwareSignature[] __attribute__((used)) =
   "Original author: Beau Kaczmarek - https://github.com/numerik11/ESP32-Irrigation-Controller";
-static const char kFirmwareVersion[] = "3.2.2";
+static const char kFirmwareVersion[] = "3.2.3";
 static const char kFirmwareBuildDate[] = __DATE__ " " __TIME__;
 static const char kUpdateReportUrl[] =
   "https://irrigation-update-counter.beaukacz86.workers.dev/v1/report";
@@ -363,7 +363,7 @@ unsigned long lastWeatherUpdate = 0;
 const unsigned long weatherUpdateInterval = 15UL * 60UL * 1000UL; // 15m
 
 // Forecast cache / metrics
-String cachedForecastData;
+bool forecastAvailable = false;
 unsigned long lastForecastUpdate = 0;
 const unsigned long forecastUpdateInterval = 60UL * 60UL * 1000UL; // 60m
 float rainNext12h_mm = NAN;
@@ -626,6 +626,13 @@ struct WeatherJob {
   int weatherCode = 0, forecastCode = 0;
 };
 static WeatherJob weatherJob;
+static void releaseWeatherJobPayloads() {
+  weatherJob.weatherPayload = static_cast<const char*>(nullptr);
+  weatherJob.forecastPayload = static_cast<const char*>(nullptr);
+  weatherJob.reportPayload = static_cast<const char*>(nullptr);
+  weatherJob.weatherError = static_cast<const char*>(nullptr);
+  weatherJob.forecastError = static_cast<const char*>(nullptr);
+}
 static QueueHandle_t weatherRequests = nullptr, weatherResults = nullptr;
 static bool weatherBusy = false;
 static uint32_t weatherGeneration = 0;
@@ -2727,6 +2734,46 @@ static const char* resetReasonText(esp_reset_reason_t reason) {
   }
 }
 
+// Bound every HTML response, including scripts and dynamic zone cards.
+// ESP32 flash strings are memory-mapped, so they can be copied in small slices.
+class HttpHtmlBuffer {
+ public:
+  static constexpr size_t kCapacity = 2048;
+  explicit HttpHtmlBuffer(WebServer& server) : server_(server), buffer_(static_cast<char*>(malloc(kCapacity))) {}
+  ~HttpHtmlBuffer() { free(buffer_); }
+  HttpHtmlBuffer(const HttpHtmlBuffer&) = delete;
+  HttpHtmlBuffer& operator=(const HttpHtmlBuffer&) = delete;
+  bool ready() const { return buffer_ != nullptr; }
+  HttpHtmlBuffer& operator+=(const String& value) { append(value.c_str(), value.length()); return *this; }
+  HttpHtmlBuffer& operator+=(const char* value) { if (value) append(value, strlen(value)); return *this; }
+  HttpHtmlBuffer& operator+=(const __FlashStringHelper* value) { return *this += reinterpret_cast<const char*>(value); }
+  HttpHtmlBuffer& operator+=(char value) { append(&value, 1); return *this; }
+  void flush() {
+    if (!used_ || failed_) return;
+    if (!server_.client().connected()) { failed_ = true; used_ = 0; return; }
+    server_.sendContent(buffer_, used_);
+    used_ = 0;
+    delay(0);
+  }
+
+ private:
+  void append(const char* data, size_t length) {
+    if (!buffer_ || failed_) return;
+    size_t offset = 0;
+    while (offset < length && !failed_) {
+      const size_t count = min(length - offset, kCapacity - used_);
+      memcpy(buffer_ + used_, data + offset, count);
+      used_ += count;
+      offset += count;
+      if (used_ == kCapacity) flush();
+    }
+  }
+  WebServer& server_;
+  char* buffer_;
+  size_t used_ = 0;
+  bool failed_ = false;
+};
+
 void handleDiagnosticsJson() {
   HttpScope _scope;
 
@@ -2930,8 +2977,13 @@ void handleDiagnosticsPage() {
   }
   if (!i2cList.length()) i2cList = "none";
 
-  String html;
-  html.reserve(12000);
+  HttpHtmlBuffer html(server);
+  if (!html.ready()) {
+    server.send(503, "text/plain", "Not enough memory to open page. Please retry.");
+    return;
+  }
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/html", "");
   auto pinText = [](int pin) -> String {
     return pin < 0 ? String("disabled") : String("GPIO") + String(pin);
   };
@@ -3080,7 +3132,8 @@ void handleDiagnosticsPage() {
   html += F("setInterval(refreshWifiStatus,60000);refreshWifiStatus();");
   html += F("</script></body></html>");
 
-  server.send(200, "text/html", html);
+  html.flush();
+  server.sendContent("");
 }
 
 #if ENABLE_OTA
@@ -3106,8 +3159,13 @@ static void handleOtaUpdatePage() {
   HttpScope _scope;
   if (!otaHttpAuthenticate()) return;
 
-  String html;
-  html.reserve(8500);
+  HttpHtmlBuffer html(server);
+  if (!html.ready()) {
+    server.send(503, "text/plain", "Not enough memory to open page. Please retry.");
+    return;
+  }
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/html", "");
   html += F("<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>");
   html += F("<title>ESP Irrigation Firmware Update</title><style>:root{color-scheme:light dark;--bg:#eef4fb;--panel:#fff;--ink:#172033;--muted:#66758a;--line:#d8e3ef;--blue:#2563eb;--bad:#b91c1c}@media(prefers-color-scheme:dark){:root{--bg:#0b1220;--panel:#111c2e;--ink:#e7eef9;--muted:#9aa9bd;--line:#293a54;--blue:#60a5fa;--bad:#f87171}}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.45 'Segoe UI',Arial,sans-serif}.wrap{max-width:680px;margin:0 auto;padding:24px}.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:22px;box-shadow:0 10px 28px rgba(15,23,42,.1)}h1{margin:0 0 8px;font-size:1.55rem}p{color:var(--muted)}.meta{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:18px 0}.meta div{border:1px solid var(--line);border-radius:8px;padding:10px}.meta span{display:block;color:var(--muted);font-size:.78rem;text-transform:uppercase;letter-spacing:.06em}input{display:block;width:100%;padding:12px;border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--ink);margin:12px 0}button,.link{display:inline-block;border:0;border-radius:8px;padding:11px 15px;background:var(--blue);color:#fff;font-weight:700;text-decoration:none;cursor:pointer}.link{background:transparent;color:var(--blue);border:1px solid var(--line);margin-left:6px}progress{width:100%;height:18px;margin-top:18px}#status{min-height:24px;font-weight:700}.warn{color:var(--bad);font-weight:700;font-size:.9rem}@media(max-width:540px){.wrap{padding:14px}.meta{grid-template-columns:1fr}}</style></head><body><main class='wrap'><section class='card'>");
   html += F("<h1>Firmware update</h1><p>Upload the application <code>.bin</code> produced with <b>Minimal SPIFFS (Large APPS with OTA)</b>.</p><div class='meta'><div><span>Installed version</span><b>");
@@ -3123,7 +3181,8 @@ static void handleOtaUpdatePage() {
   html += F("function githubFirmwareUrl(value){const u=new URL(value);if(u.protocol!=='https:'||u.username||u.password||u.port)throw Error('Use a public HTTPS GitHub file URL.');if(u.hostname==='github.com'){const parts=u.pathname.split('/');if(parts[3]!=='blob'&&parts[3]!=='raw')throw Error('Use a GitHub file or raw link. Download release assets and use file upload.');parts.splice(3,1);u.hostname='raw.githubusercontent.com';u.pathname=parts.join('/');}if(u.hostname!=='raw.githubusercontent.com')throw Error('Use a github.com file link or raw.githubusercontent.com URL.');if(!u.pathname.toLowerCase().endsWith('.bin'))throw Error('The URL must point to an application .bin file.');u.search='';u.hash='';return u.href;}");
   html += F("urlForm.addEventListener('submit',async e=>{e.preventDefault();try{const url=githubFirmwareUrl(document.getElementById('firmwareUrl').value.trim());if(!confirm('Download this firmware, install it and restart the controller?'))return;busy(true);progress.hidden=false;progress.removeAttribute('value');status.textContent='Downloading from GitHub...';const response=await fetch(url,{credentials:'omit',cache:'no-store',signal:AbortSignal.timeout(120000)});if(!response.ok)throw Error('GitHub download failed (HTTP '+response.status+').');const blob=await response.blob();if(blob.size===0||blob.size>OTA_MAX_BYTES)throw Error('Firmware is empty or exceeds the available OTA slot.');const header=new Uint8Array(await blob.slice(0,1).arrayBuffer());if(header[0]!==0xe9)throw Error('The download is not an ESP application image.');const data=new FormData();data.append('firmware',blob,'firmware.bin');uploadFirmware(data);}catch(error){status.textContent=(error.message||'Download failed.')+' You can also download the .bin and upload it above.';progress.hidden=true;busy(false);}});");
   html += F("</script></body></html>");
-  server.send(200, "text/html", html);
+  html.flush();
+  server.sendContent("");
 }
 
 static void handleOtaUploadData() {
@@ -3240,8 +3299,6 @@ void setup() {
   // Pre-size hot Strings to reduce heap churn over long runtimes.
   meteoLocation.reserve(64);
   meteoModel.reserve(24);
-  cachedWeatherData.reserve(4096);
-  cachedForecastData.reserve(16384);
   lastWeatherError.reserve(96);
   lastForecastError.reserve(96);
 
@@ -4773,9 +4830,11 @@ void updateCachedWeather() {
   unsigned long nowms = millis();
   bool weatherChanged = false;
   bool completed = false;
+  bool resultReceived = false;
   uint8_t token = 1;
   if (weatherBusy && xQueueReceive(weatherResults, &token, 0) == pdTRUE) {
     weatherBusy = false;
+    resultReceived = true;
     completed = weatherJob.generation == weatherGeneration;
     if (completed && weatherJob.moisture && moistureProbeEnabled && moistureUseMeteo) {
       meteoMoisturePct = weatherJob.moisturePct;
@@ -4812,7 +4871,7 @@ void updateCachedWeather() {
   if (completed && weatherJob.forecast) {
     String& freshFc = weatherJob.forecastPayload;
     if (freshFc.length() > 0) {
-      cachedForecastData = freshFc;
+      forecastAvailable = true;
       lastForecastUpdate = nowms;
 
       rainNext12h_mm = 0; 
@@ -4827,7 +4886,7 @@ void updateCachedWeather() {
       daylightDate[0] = '\0';
 
       JsonDocument fc;
-      if (deserializeJson(fc, cachedForecastData) == DeserializationError::Ok) {
+      if (deserializeJson(fc, freshFc) == DeserializationError::Ok) {
         JsonObject daily = fc["daily"].as<JsonObject>();
         JsonArray sunr = daily["sunrise"].as<JsonArray>();
         JsonArray suns = daily["sunset"].as<JsonArray>();
@@ -4882,10 +4941,14 @@ void updateCachedWeather() {
     }
   }
 
+  // Only loop() owns the job after consuming the result token. Free payload
+  // capacity even for stale results; assigning "" would retain the allocation.
+  if (resultReceived) releaseWeatherJobPayloads();
+
   // Apply results before transferring the job back to the network task.
   if (!weatherBusy && WiFi.status() == WL_CONNECTED && isValidLatLon(meteoLat, meteoLon)) {
     const bool needCur = (cachedWeatherData == "" || nowms - lastWeatherUpdate >= weatherUpdateInterval) && currentRetry.ready(nowms);
-    const bool needFc = (cachedForecastData == "" || nowms - lastForecastUpdate >= forecastUpdateInterval) && forecastRetry.ready(nowms);
+    const bool needFc = (!forecastAvailable || nowms - lastForecastUpdate >= forecastUpdateInterval) && forecastRetry.ready(nowms);
     const bool needMoisture = moistureProbeEnabled && moistureUseMeteo &&
       (!meteoMoistureAttempted || nowms - meteoMoistureAttemptMs >= 15UL * 60UL * 1000UL);
     if (needCur || needFc || needMoisture) {
@@ -6767,46 +6830,6 @@ static NextWaterInfo computeNextWatering() {
 }
 
 // Main Page
-// Bound the complete response, including scripts and dynamic zone cards.
-// ESP32 flash strings are memory-mapped, so they can be copied in small slices.
-class HttpHtmlBuffer {
- public:
-  static constexpr size_t kCapacity = 2048;
-  explicit HttpHtmlBuffer(WebServer& server) : server_(server), buffer_(static_cast<char*>(malloc(kCapacity))) {}
-  ~HttpHtmlBuffer() { free(buffer_); }
-  HttpHtmlBuffer(const HttpHtmlBuffer&) = delete;
-  HttpHtmlBuffer& operator=(const HttpHtmlBuffer&) = delete;
-  bool ready() const { return buffer_ != nullptr; }
-  HttpHtmlBuffer& operator+=(const String& value) { append(value.c_str(), value.length()); return *this; }
-  HttpHtmlBuffer& operator+=(const char* value) { if (value) append(value, strlen(value)); return *this; }
-  HttpHtmlBuffer& operator+=(const __FlashStringHelper* value) { return *this += reinterpret_cast<const char*>(value); }
-  HttpHtmlBuffer& operator+=(char value) { append(&value, 1); return *this; }
-  void flush() {
-    if (!used_ || failed_) return;
-    if (!server_.client().connected()) { failed_ = true; used_ = 0; return; }
-    server_.sendContent(buffer_, used_);
-    used_ = 0;
-    delay(0);
-  }
-
- private:
-  void append(const char* data, size_t length) {
-    if (!buffer_ || failed_) return;
-    size_t offset = 0;
-    while (offset < length && !failed_) {
-      const size_t count = min(length - offset, kCapacity - used_);
-      memcpy(buffer_ + used_, data + offset, count);
-      used_ += count;
-      offset += count;
-      if (used_ == kCapacity) flush();
-    }
-  }
-  WebServer& server_;
-  char* buffer_;
-  size_t used_ = 0;
-  bool failed_ = false;
-};
-
 void handleRoot() {
   HttpScope _scope;  // NEW: mark that we're in an HTTP handler so no blocking fetches
 
@@ -7869,20 +7892,14 @@ void handleSetupPage() {
   // Settings are loaded at boot and updated in RAM by the save handlers.
   // Stream this large page in sections. A classic ESP32 cannot reliably grow
   // one contiguous String large enough for the complete setup form.
-  String html;
-  if (!html.reserve(7000)) {
+  HttpHtmlBuffer html(server);
+  if (!html.ready()) {
     server.send(503, "text/plain", "Not enough memory to open Setup. Please retry.");
     return;
   }
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/html", "");
-  auto flush = [&](){
-    if (html.length()) {
-      server.sendContent(html);
-      html = "";
-    }
-    delay(0);
-  };
+  auto flush = [&](){ html.flush(); };
   const int uiMaxGpio = 
   #if defined(CONFIG_IDF_TARGET_ESP32)
     39;
@@ -7906,15 +7923,12 @@ void handleSetupPage() {
   auto addTzOption = [&](const char* name, const char* posix) {
     html += F("<option value='");
     html += name;
-  if (html.length() >= 3000) flush();
     html += F("' data-posix='");
     html += posix;
-  if (html.length() >= 3000) flush();
     html += F("'");
     if (tzIANA == name) html += F(" selected");
     html += F(">");
     html += name;
-  if (html.length() >= 3000) flush();
     html += F("</option>");
   };
 
@@ -7939,7 +7953,6 @@ void handleSetupPage() {
   html += F(".setup-overview-title{margin:0 0 12px 0;font-size:.78rem;letter-spacing:.16em;text-transform:uppercase;font-weight:850;color:#38bdf8}");
   html += F(".setup-badges{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}");
   html += F(".setup-badge{padding:12px 13px;border-radius:15px;border:1px solid rgba(92,131,125,.24);background:linear-gradient(180deg,rgba(255,255,255,.08),rgba(147,197,253,.04))}");
-  if (html.length() >= 3000) flush();
   html += F(".setup-badge-k{font-size:.73rem;letter-spacing:.14em;text-transform:uppercase;color:#9ab4ad;font-weight:800}");
   html += F(".setup-badge-v{margin-top:6px;font-size:1rem;font-weight:760;color:#f0f8f3}");
   html += F(".setup-nav{display:flex;gap:10px;flex-wrap:wrap;margin:0 0 16px;padding:8px;border-radius:16px;position:sticky;top:10px;z-index:8;");
@@ -7954,7 +7967,6 @@ void handleSetupPage() {
   html += F(".save-confirm.show{display:inline-flex;align-items:center}");
   html += F(".card-intro{margin:0 0 8px;color:#9ab4ad;font-size:.9rem;max-width:62ch}");
   html += F(".theme-switch{display:flex;align-items:center;gap:6px;font-weight:700;color:#d5e4de}");
-  if (html.length() >= 3000) flush();
   html += F(".switch{position:relative;display:inline-block;width:42px;height:24px;min-width:unset}");
   html += F(".switch input{opacity:0;width:0;height:0}");
   html += F(".slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:#16262a;border:1px solid #284449;transition:.2s;border-radius:999px}");
@@ -7977,7 +7989,6 @@ void handleSetupPage() {
   html += F("input[type=number].in-sm{max-width:160px}");
   html += F("input[type=number].in-md{max-width:240px}");
   html += F(".row{display:flex;align-items:center;gap:12px;margin:10px 0;padding-top:10px;border-top:1px solid rgba(41,69,74,.7);flex-wrap:wrap}.row small{color:#9ab4ad;font-size:.85rem}");
-  if (html.length() >= 3000) flush();
   html += F(".card h3 + .row{border-top:none;padding-top:0}");
   html += F(".btn{background:linear-gradient(180deg,#2563eb,#1e40af);color:#fff;border:1px solid rgba(0,0,0,.18);border-radius:12px;padding:10px 14px;font-weight:700;cursor:pointer;box-shadow:0 6px 16px rgba(30,64,175,.28);font-size:.95rem}");
   html += F(".btn-alt{background:#17272b;color:#e7f1ec;border:1px solid #294b73;border-radius:12px;padding:10px 14px;font-size:.95rem}");
@@ -7994,7 +8005,6 @@ void handleSetupPage() {
   html += F(".switchline{display:flex;gap:12px;align-items:center;flex-wrap:wrap}");
   html += F("input[type=checkbox]:not(#themeToggle),input[type=radio]{appearance:none;-webkit-appearance:none;width:18px;height:18px;margin:0;flex:0 0 18px;display:inline-grid;place-content:center;cursor:pointer;");
   html += F("border:1.6px solid rgba(255,255,255,.78);background:transparent;box-shadow:none;transition:border-color .12s ease,background .12s ease,box-shadow .12s ease,transform .06s ease}");
-  if (html.length() >= 3000) flush();
   html += F("input[type=checkbox]:not(#themeToggle){border-radius:6px}");
   html += F("input[type=radio]{border-radius:999px}");
   html += F("input[type=checkbox]:not(#themeToggle)::before,input[type=radio]::before{content:'';display:block;transform:scale(0);transition:transform .12s ease}");
@@ -8020,7 +8030,6 @@ void handleSetupPage() {
   html += F("details.collapse summary{cursor:pointer;outline:none;list-style:none;font-weight:800;font-size:1.05rem;color:#e7f1ec;padding:4px 0}");
   html += F("details.collapse summary::-webkit-details-marker{display:none}");
   html += F("details.collapse summary:after{content:'>';margin-left:8px;transition:transform .18s ease;display:inline-block;width:26px;height:26px;line-height:24px;text-align:center;border-radius:999px;border:1px solid rgba(92,131,125,.22);background:rgba(255,255,255,.04)}");
-  if (html.length() >= 3000) flush();
   html += F("details.collapse[open] summary:after{transform:rotate(90deg)}");
   html += F("details.collapse[open] summary:after{background:rgba(37,99,235,.16);border-color:rgba(147,197,253,.3)}");
   html += F(".collapse-body{margin-top:10px;padding-top:4px}");
@@ -8051,7 +8060,6 @@ void handleSetupPage() {
   html += F("html[data-theme='light'] input[type=text],html[data-theme='light'] input[type=number],html[data-theme='light'] select,html[data-theme='light'] textarea{background:#f7faf8;color:#14232b;border-color:#c9d9d0}");
   html += F("html[data-theme='light'] .chip{background:#eef6f2;border-color:#c9d9d0;color:#213433}");
   html += F("html[data-theme='light'] input[type=checkbox]:not(#themeToggle),html[data-theme='light'] input[type=radio]{border-color:#8aa59c;background:rgba(255,255,255,.78);box-shadow:inset 0 1px 0 rgba(255,255,255,.75)}");
-  if (html.length() >= 3000) flush();
   html += F("html[data-theme='light'] input[type=checkbox]:not(#themeToggle)::before{border-right-color:#1e40af;border-bottom-color:#1e40af}");
   html += F("html[data-theme='light'] input[type=radio]::before{background:#1e40af}");
   html += F("html[data-theme='light'] input[type=checkbox]:not(#themeToggle):checked,html[data-theme='light'] input[type=radio]:checked{border-color:#2563eb;background:#ffffff;box-shadow:0 0 0 3px rgba(37,99,235,.12)}");
@@ -8070,7 +8078,6 @@ void handleSetupPage() {
   html += F("html[data-theme='light'] .setup-badge-v{color:#14232b}");
   html += F("html[data-theme='light'] .setup-nav{background:rgba(255,255,255,.8);border-color:#d7e2f0;box-shadow:0 10px 28px rgba(16,24,40,.08)}");
   html += F("html[data-theme='light'] .setup-nav a{background:rgba(255,255,255,.88);border-color:#d7e2f0;color:#213433}");
-  if (html.length() >= 3000) flush();
   html += F("html[data-theme='light'] .setup-nav a:hover{background:#eef5ff;border-color:#b7d5c8;box-shadow:0 10px 24px rgba(37,99,235,.08)}");
   html += F("html[data-theme='light'] .card-intro{color:#607571}");
   html += F("html[data-theme='light'] .row{border-top-color:#e4ece7}");
@@ -8097,7 +8104,6 @@ void handleSetupPage() {
   html += F(".theme-switch{font-size:.88rem}");
   html += F(".card{position:relative;overflow:hidden}");
   html += F(".card::before{content:'';position:absolute;left:0;right:0;top:0;height:3px;background:linear-gradient(90deg,#2563eb,#38bdf8)}");
-  if (html.length() >= 3000) flush();
   html += F("input[type=text],input[type=number],select{font-family:'Sora','Trebuchet MS',sans-serif}");
   html += F("input[type=text]:focus-visible,input[type=number]:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px solid #2563eb;outline-offset:1px;box-shadow:0 0 0 3px rgba(37,99,235,.18)}");
   html += F(".btn,.btn-alt{font-weight:760;letter-spacing:.16px}");
@@ -8114,7 +8120,6 @@ void handleSetupPage() {
   html += F(".setup-badge{border-radius:8px;background:#10233d;border-color:#294b73}.setup-nav,.setup-actions-top{border-color:#24405f;box-shadow:0 8px 22px rgba(0,0,0,.18)}");
   html += F(".page-kicker{color:#93c5fd}.card{border-color:#24405f;box-shadow:0 8px 24px rgba(0,0,0,.22)}.card:hover{transform:none;box-shadow:0 10px 28px rgba(0,0,0,.26)}.card h3{border-bottom:1px solid #294b73;letter-spacing:0}");
   html += F(".slider{border-color:#294b73}.switch input:checked + .slider{background:#2563eb;border-color:#2563eb}.btn{background:linear-gradient(180deg,#2563eb,#1e40af);box-shadow:0 6px 16px rgba(37,99,235,.22)}");
-  if (html.length() >= 3000) flush();
   html += F(".row{gap:10px 14px}details.collapse summary:after{content:'>';border-radius:8px}input:focus-visible,select:focus-visible,input[type=text]:focus-visible,input[type=number]:focus-visible{outline-color:#38bdf8;box-shadow:0 0 0 3px rgba(37,99,235,.18)}");
   html += F("html[data-theme='light'] body{background:linear-gradient(180deg,#fbfdff,#f3f7fc)}html[data-theme='light'] .page-head,html[data-theme='light'] .setup-hero,html[data-theme='light'] .card{box-shadow:0 8px 24px rgba(16,24,40,.08)}");
   html += F("html[data-theme='light'] .page-kicker{color:#2563eb}html[data-theme='light'] .card h3{border-bottom-color:#2563eb}html[data-theme='light'] .btn{background:linear-gradient(180deg,#2563eb,#1e40af)}html[data-theme='light'] .setup-badge{background:linear-gradient(180deg,#ffffff,#eef5ff);border-color:#d7e2f0}");
@@ -8122,54 +8127,43 @@ void handleSetupPage() {
   html += F("input[type=checkbox]:not(#themeToggle):focus-visible,input[type=radio]:focus-visible{box-shadow:0 0 0 3px rgba(37,99,235,.2)}html[data-theme='light'] input[type=checkbox]:not(#themeToggle)::before{border-right-color:#1e40af;border-bottom-color:#1e40af}");
   html += F("html[data-theme='light'] input[type=radio]::before{background:#1e40af}html[data-theme='light'] input[type=checkbox]:not(#themeToggle):checked,html[data-theme='light'] input[type=radio]:checked{border-color:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,.12)}");
   html += F("html[data-theme='light'] input[type=checkbox]:not(#themeToggle):focus-visible,html[data-theme='light'] input[type=radio]:focus-visible{border-color:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,.14)}html[data-theme='light'] .setup-nav a:hover{background:#eef5ff;border-color:#bfdbfe;box-shadow:0 10px 24px rgba(37,99,235,.08)}");
-  if (html.length() >= 3000) flush();
   html += F("details.collapse summary,html[data-theme='dark'] details.collapse summary{color:#ffffff}html[data-theme='light'] details.collapse summary{color:#000000}");
   html += F("@media(max-width:760px){.page-head{padding:10px 12px}.page-head h1{font-size:1.2rem}.setup-hero{grid-template-columns:1fr}.setup-badges{grid-template-columns:1fr 1fr}.setup-nav{top:8px;flex-wrap:nowrap;overflow:auto;padding-bottom:6px}.setup-nav a{white-space:nowrap}.setup-actions-top{top:8px;z-index:9;padding:10px;border-radius:14px;background:rgba(13,23,24,.88);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);border:1px solid rgba(92,131,125,.2)}.row{padding-top:8px;flex-direction:column;align-items:stretch}.row label{min-width:0;width:100%}.row .btn,.row .btn-alt{width:100%}.switchline{align-items:flex-start}}");
   flush();
   html += F(":root{--setup-bg:#f3f7fc;--setup-panel:#ffffff;--setup-ink:#172033;--setup-muted:#68758a;--setup-line:#dbe4ef;--setup-blue:#2563eb}html[data-theme='dark']{--setup-bg:#0b1220;--setup-panel:#111c2e;--setup-ink:#e7eef9;--setup-muted:#9aa9bd;--setup-line:#293a54;--setup-blue:#60a5fa}.wrap{max-width:1180px;margin:0 auto;padding:0 20px}body{background:var(--setup-bg);color:var(--setup-ink)}.page-head{margin:0 -20px 16px;padding:16px 20px;border:0;border-bottom:1px solid var(--setup-line);border-radius:0;background:var(--setup-panel);box-shadow:0 4px 14px rgba(15,23,42,.06)}.page-kicker{color:var(--setup-blue)}.page-sub,.setup-hero-copy p,.card-intro,.row small{color:var(--setup-muted)}.setup-hero{display:block;margin:0 -20px 16px;padding:18px 20px;border-radius:0;background:var(--setup-panel);border:0;border-bottom:1px solid var(--setup-line);box-shadow:none}.setup-overview-title{color:var(--setup-blue);margin-bottom:10px}.setup-badges{grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.setup-badge{border-radius:7px;padding:12px;background:var(--setup-bg);border:1px solid var(--setup-line)}.setup-badge-k{color:var(--setup-muted)}.setup-badge-v{color:var(--setup-ink)}.setup-nav{top:8px;margin:0 0 10px;padding:7px;border-radius:7px;background:var(--setup-panel);border:1px solid var(--setup-line);box-shadow:0 5px 14px rgba(15,23,42,.08)}.setup-nav a{border-radius:6px;background:transparent;color:var(--setup-muted);border-color:transparent;padding:8px 11px}.setup-nav a:hover{transform:none;background:rgba(37,99,235,.1);border-color:rgba(37,99,235,.22);color:var(--setup-blue);box-shadow:none}.setup-actions-top{top:61px;margin:0 0 16px;padding:8px;border-radius:7px;background:var(--setup-panel);border:1px solid var(--setup-line);box-shadow:0 5px 14px rgba(15,23,42,.08)}.card{border-radius:7px;background:var(--setup-panel);border:1px solid var(--setup-line);box-shadow:0 6px 18px rgba(15,23,42,.06)}.card::before{height:2px;background:var(--setup-blue)}.card h3{color:var(--setup-ink)}details.collapse summary{color:var(--setup-ink);padding:7px 0;font-size:1rem}details.collapse summary:after{border-radius:6px;border-color:var(--setup-line);background:var(--setup-bg)}.collapse-body{border-top:1px solid var(--setup-line);padding-top:12px}.row{border-top-color:var(--setup-line)}label{color:var(--setup-ink)}input[type=text],input[type=number],select,textarea{background:var(--setup-bg);color:var(--setup-ink);border-color:var(--setup-line);border-radius:6px}.chip{background:var(--setup-bg);border-color:var(--setup-line);color:var(--setup-ink);border-radius:6px}.btn,.btn-alt{border-radius:6px}.btn-alt{background:var(--setup-bg);color:var(--setup-ink);border-color:var(--setup-line)}.save-confirm{margin-left:auto}@media(max-width:760px){.wrap{padding:0 12px}.page-head,.setup-hero{margin-left:-12px;margin-right:-12px;padding-left:12px;padding-right:12px}.setup-badges{grid-template-columns:repeat(2,minmax(0,1fr))}.setup-nav{top:8px}.setup-actions-top{top:58px}.setup-actions-top .save-confirm{margin-left:0}.row{padding-top:10px}}@media(max-width:440px){.setup-badges{grid-template-columns:1fr}.setup-actions-top .btn,.setup-actions-top .btn-alt{flex:1 1 100%}}</style></head><body>");
-  if (html.length() >= 3000) flush();
+
   // Setup-only compact styling uses the dashboard typography, palette and spacing.
   flush();
   html += F("<style>html,body,input,select,button{font-family:'Segoe UI',Arial,sans-serif}html body{background:var(--setup-bg)}.wrap{margin:12px auto;padding:0 14px}html[data-theme] .page-head{margin:0 0 10px;padding:10px 12px;border-radius:7px;background:#1e3a8a;border:0;color:#fff}html .page-head h1{font-size:1rem;margin:3px 0;color:#fff}html .page-head .page-kicker,html .page-head .page-sub{color:#dbeafe}.page-sub{font-size:.78rem}.page-head-copy{min-width:0}.theme-switch{flex-shrink:0}html[data-theme] .setup-hero{margin:0 0 10px;padding:10px 12px;border:1px solid var(--setup-line);border-radius:7px;background:var(--setup-panel)}.setup-overview-title{margin-bottom:7px;font-size:.68rem}.setup-badges{grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}.setup-badge{padding:7px 9px;min-width:0}.setup-badge-k{font-size:.6rem;letter-spacing:.08em}.setup-badge-v{font-size:.85rem;overflow-wrap:anywhere}#setupForm>.setup-nav{position:static;flex-wrap:wrap;overflow:visible;gap:5px;padding:6px;margin-bottom:8px}.setup-nav a{flex:1 1 auto;padding:7px 9px;font-size:.75rem}#setupForm>.setup-actions-top{position:static;gap:6px;padding:7px;margin-bottom:8px}.setup-actions-top .btn,.setup-actions-top .btn-alt{flex:0 1 auto;padding:8px 10px;font-size:.78rem}#setupForm .card.narrow{box-sizing:border-box;width:100%;min-width:0;margin:0 0 8px;padding:8px 12px;animation:none}#setupForm details.collapse>summary{min-height:30px;padding:4px 0;font-size:.88rem}#setupForm .collapse-body{padding-top:8px}.card-intro{margin:0 0 8px;font-size:.8rem}.row{gap:8px;padding-top:8px;margin:8px 0}.setup-merged{border-top:1px solid var(--setup-line);margin-top:12px;padding-top:8px}.setup-merged h3{font-size:.85rem}#setupForm [id$='-card']{scroll-margin-top:12px}input,select{max-width:100%;box-sizing:border-box}@media(max-width:760px){.wrap{padding:0 10px;margin:10px auto}.setup-badges{grid-template-columns:repeat(2,minmax(0,1fr))}.page-head{gap:8px;flex-wrap:wrap}.setup-actions-top .btn,.setup-actions-top .btn-alt{flex:1 1 auto}.row label{min-width:0}.panel-split{grid-template-columns:minmax(0,1fr)}}</style>");
-  if (html.length() >= 3000) flush();
+
   flush();
 
   html += F("<div class='wrap'><div class='page-head'><div class='page-head-copy'><div class='page-kicker'>Controller configuration</div><h1>System Setup</h1><div class='page-sub'>Firmware v");
   html += kFirmwareVersion;
-  if (html.length() >= 3000) flush();
   html += F(" - Start with zones and water source, then set weather, time, display, and hardware pins.</div></div>");
   html += F("<div class='theme-switch'><span>Light</span><label class='switch'><input type='checkbox' id='themeToggle'><span class='slider'></span></label><span>Dark</span></div>");
   html += F("</div>");
   html += F("<div class='setup-hero badges-only'><div class='setup-overview-title'>Current Configuration</div><div class='setup-badges'>");
   html += F("<div class='setup-badge'><div class='setup-badge-k'>Zone Count</div><div class='setup-badge-v'>"); html += String(zonesCount); html += F(" configured</div></div>");
-  if (html.length() >= 3000) flush();
   html += F("<div class='setup-badge'><div class='setup-badge-k'>Display</div><div class='setup-badge-v'>"); html += setupDisplayLabel; html += F("</div></div>");
-  if (html.length() >= 3000) flush();
   html += F("<div class='setup-badge'><div class='setup-badge-k'>Water Source</div><div class='setup-badge-v'>"); html += setupTankLabel; html += F("</div></div>");
-  if (html.length() >= 3000) flush();
   html += F("<div class='setup-badge'><div class='setup-badge-k'>Time Mode</div><div class='setup-badge-v'>"); html += setupTzLabel; html += F("</div></div>");
-  if (html.length() >= 3000) flush();
   html += F("<div class='setup-badge'><div class='setup-badge-k'>Forecast Site</div><div class='setup-badge-v'>"); html += setupWeatherLabel; html += F("</div></div>");
-  if (html.length() >= 3000) flush();
   html += F("<div class='setup-badge'><div class='setup-badge-k'>Forecast Model</div><div class='setup-badge-v'>"); html += setupModelLabel; html += F("</div></div>");
-  if (html.length() >= 3000) flush();
   html += F("</div></div>");
   html += F("<style>#setupForm{display:flex;flex-direction:column}.card.narrow{width:300mm;max-width:100%;align-self:center}#setupForm>.setup-nav{order:0}#setupForm>.setup-actions-top{order:1}#smart-card{order:10}#delays-card{order:20}#no-water-card{order:25}#weather-card{order:30}#tank-card{order:40}#rain-card{order:50}#timezone-card{order:60}#pins-card{order:70}#i2c-card{order:80}#buttons-card{order:90}#display-card{order:100}#advanced-card{order:110}#schedule-html-card{order:120}#mqtt-card{order:130}#ota-card{order:140}#scheduleHtmlCss{max-width:none;min-height:220px;resize:vertical;font:13px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace}</style>");
   html += F("<form id='setupForm' action='/configure' method='POST' novalidate>");
   html += F("<div class='setup-nav'><a href='#smart-card'>Smart Watering</a><a href='#delays-card'>Delays &amp; Pause</a><a href='#no-water-card'>No-Watering Periods</a><a href='#weather-card'>Forecast</a><a href='#tank-card'>Water &amp; Tank</a><a href='#rain-card'>Rain Inputs</a><a href='#timezone-card'>Timezone</a><a href='#pins-card'>GPIO</a><a href='#i2c-card'>I2C</a><a href='#buttons-card'>Buttons</a><a href='#display-card'>Display</a><a href='#advanced-card'>TFT Pins</a><a href='#schedule-html-card'>Schedule CSS</a><a href='#mqtt-card'>MQTT</a><a href='#ota-card'>Firmware</a></div>");
   html += F("<div class='setup-actions-top'><button class='btn' type='submit' id='btn-save-setup'>Save Changes</button><a class='btn-alt' href='/'>Home</a><a class='btn-alt' href='https://numerik11.github.io/ESP32-Irrigation-Controller/web-flasher/?current=");
   html += kFirmwareVersion;
-  if (html.length() >= 3000) flush();
   html += F("' target='_blank' rel='noopener'>Web Flasher</a><a class='btn-alt' href='/update'>Browser OTA</a><button class='btn-alt' type='button' id='btn-clear-cooldown'>Clear After-Rain Delay</button><button class='btn btn-danger' type='button' onclick=\"if(confirm('Reboot controller now?'))fetch('/reboot',{method:'POST'})\">Reboot</button><span class='save-confirm' id='save-confirm'>Saved</span></div>");
 
   // Tank (available for all modes; water source switching works with any zone count)
   html += F("<div class='card narrow' id='tank-card'><details class='collapse'><summary>Water Source & Tank</summary><div class='collapse-body'><p class='card-intro'>Control how the controller chooses between tank and mains and where the tank sensor is connected.</p>");
   html += F("<div class='row switchline'><label>Enable Tank</label><input type='checkbox' name='tankEnabled' ");
   html += (tankEnabled ? "checked" : "");
-  if (html.length() >= 3000) flush();
   html += F("><small>Unchecked = ignore tank level and force mains</small></div>");
   html += F("<div id='tankCard'>");
-
   html += F("<div class='row switchline'><label>Water Source</label>");
 
   // Auto
@@ -8186,26 +8180,22 @@ void handleSetupPage() {
   html += F("<label><input type='radio' name='waterMode' value='mains' ");
   if (justUseMains) html += F("checked");
   html += F("> Only City Water</label>");
-
   html += F("<small>");
   html += "Tank/City Water switching (USE BACKFLOW PREVENTION!)";
-  if (html.length() >= 3000) flush();
   html += F("</small></div>");
-
   html += F("<div class='row'><label>Tank Low Threshold (%)</label>"
             "<input class='in-xs' type='number' min='0' max='100' name='tankThresh' value='");
   html += String(tankLowThresholdPct);
-  if (html.length() >= 3000) flush();
   html += F("'><small>Switch to city water if tank drops below this level</small></div>");
 
   #if defined(CONFIG_IDF_TARGET_ESP32)
     html += F("<div class='row'><label>Tank Level Sensor GPIO</label><input class='in-xs' type='number' min='-1' max='39' name='tankLevelPin' value='");
     html += String(tankLevelPin); html += F("'><small>-1 disables. ADC1 pin (ESP32: GPIO32-39)</small></div>");
-  if (html.length() >= 3000) flush();
+
   #else
     html += F("<div class='row'><label>Tank Level Sensor GPIO</label><input class='in-xs' type='number' min='-1' max='20' name='tankLevelPin' value='");
     html += String(tankLevelPin); html += F("'><small>-1 disables. ADC pin (ESP32-S3: GPIO1-20)</small></div>");
-  if (html.length() >= 3000) flush();
+
   #endif
   html += F("<div class='row'><label></label><a class='btn-alt' href='/tank'>Calibrate Tank</a></div>");
   html += F("</div>"); // end tankCard
@@ -8221,13 +8211,10 @@ void handleSetupPage() {
   html += F("<div class='subhead'>Delay Toggles</div><hr class='hr'>");
   html += F("<div class='row switchline'><label>Rain Delay</label><input type='checkbox' name='rainDelay' ");
   html += (rainDelayEnabled ? "checked" : ""); html += F("></div>");
-  if (html.length() >= 3000) flush();
   html += F("<div class='row switchline'><label>Wind Delay</label><input type='checkbox' name='windCancelEnabled' ");
   html += (windDelayEnabled ? "checked" : ""); html += F("></div>");
-  if (html.length() >= 3000) flush();
   html += F("<div class='row switchline'><label>System Pause</label><input type='checkbox' name='pauseEnable' ");
   html += (systemPaused ? "checked" : ""); html += F("><small>Enable System Pause</small></div>");
-  if (html.length() >= 3000) flush();
   html += F("<div class='row' style='gap:8px;flex-wrap:wrap'>");
   html += F("<button class='btn' type='button' id='btn-pause-24'>Pause 24h</button>");
   html += F("<button class='btn' type='button' id='btn-pause-7d'>Pause 7d</button>");
@@ -8237,7 +8224,7 @@ void handleSetupPage() {
     {
     uint32_t remain = (pauseUntilEpoch > nowEp && systemPaused) ? (pauseUntilEpoch - nowEp) : 0;
     html += String(remain/3600);
-  if (html.length() >= 3000) flush();
+
   }
   html += F("'></div>");
   html += F("</div>");
@@ -8248,17 +8235,13 @@ void handleSetupPage() {
   html += F("<div class='subhead'>Thresholds & Timers</div><hr class='hr'>");
   html += F("<div class='row'><label>Wind Threshold (m/s)</label><input class='in-sm' type='number' step='0.1' min='0' max='50' name='windSpeedThreshold' value='");
   html += String(windSpeedThreshold,1); html += F("'></div>");
-  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>After-Rain Delay (hours)</label><input class='in-sm' type='number' min='0' max='720' name='rainCooldownHours' value='");
   html += String(rainCooldownMin / 60);
-  if (html.length() >= 3000) flush();
   html += F("'><small>Delay period after rain stops</small></div>");
   html += F("<div class='row'><label>Rain Threshold 24h (mm)</label><input class='in-sm' type='number' min='0' max='200' name='rainThreshold24h' value='");
   html += String(rainThreshold24h_mm);
-  if (html.length() >= 3000) flush();
   html += F("'><small>After-Rain Delay if above threshold</small></div>");
   html += F("</div>");
-
   html += F("</div>"); // end cols2
   html += F("</div></details></div>"); // end Delays card
 
@@ -8270,22 +8253,20 @@ void handleSetupPage() {
   html += F("<div class='subhead'>Runtime Rules</div><hr class='hr'>");
   html += F("<div class='row switchline'><label>Smart Watering</label><input type='checkbox' name='smartWatering' ");
   html += (smartWateringEnabled ? "checked" : "");
-  if (html.length() >= 3000) flush();
   html += F("><small>Adjust scheduled and manual runtimes using these rules</small></div>");
   html += F("<div class='row'><label for='smartTempBasis'>Temperature Basis</label><select id='smartTempBasis' name='smartTempBasis'>");
   const char* basisLabels[]={"Current temperature (forecast max fallback)","Forecast maximum today","Forecast average (daily min/max midpoint)"};
   for (int i=0;i<3;++i) {
     html += F("<option value='"); html += String(i); html += F("'");
-  if (html.length() >= 3000) flush();
+
     if (smartTempBasis==i) html += F(" selected");
     html += F(">"); html += basisLabels[i]; html += F("</option>");
-  if (html.length() >= 3000) flush();
+
   }
   html += F("</select><small>Forecast maximum is recommended for early-morning watering. If the selected forecast is unavailable, no temperature adjustment is applied.</small></div>");
   html += F("<style>#smart-card .panel-split>div{min-width:0}.smart-scroll{overflow-x:auto}.smart-table{width:100%;border-collapse:collapse}.smart-table th,.smart-table td{padding:8px 6px;text-align:left;border-bottom:1px solid var(--border,#ddd)}.smart-table input{width:82px;min-width:65px}</style>");
   html += F("<div class='smart-scroll'><table class='smart-table'><thead><tr><th>Condition</th><th>Temperature (<span data-temp-unit>");
   html += temperatureUnitChar();
-  if (html.length() >= 3000) flush();
   html += F("</span>)</th><th>Runtime Adjustment (%)</th></tr></thead><tbody>");
   const char* ruleNames[]={"Cool","Hot","Very Hot"};
   const char* tempNames[]={"smartCoolTemp","smartHotTemp","smartVeryHotTemp"};
@@ -8295,63 +8276,49 @@ void handleSetupPage() {
   for (int i=0;i<3;++i) {
     if (i==1) html += F("<tr><th>Normal</th><td id='smartNormalRange'></td><td>0%</td></tr>");
     html += F("<tr><th>"); html += ruleNames[i]; html += F("</th><td>");
-  if (html.length() >= 3000) flush();
     html += i==0 ? F("Below ") : F("At/above ");
-  if (html.length() >= 3000) flush();
     html += F("<input required data-smart-temp type='number' step='0.1' name='"); html += tempNames[i];
-  if (html.length() >= 3000) flush();
     html += F("' aria-label='"); html += ruleNames[i]; html += F(" temperature' value='");
-  if (html.length() >= 3000) flush();
     html += String(temperatureForDisplay(ruleTemps[i]),1);
-  if (html.length() >= 3000) flush();
     html += F("'></td><td><input required type='number' min='-100' max='300' name='"); html += pctNames[i];
-  if (html.length() >= 3000) flush();
     html += F("' aria-label='"); html += ruleNames[i]; html += F(" runtime adjustment percent' value='");
-  if (html.length() >= 3000) flush();
     html += String(rulePcts[i]); html += F("'></td></tr>");
-  if (html.length() >= 3000) flush();
+
   }
   html += F("</tbody></table></div>");
   html += F("<div class='row'><label>Minimum Adjusted Runtime (minutes)</label><input class='in-sm' type='number' min='0' max='1440' name='smartMinimumMin' value='");
   html += String(smartMinimumMin);
-  if (html.length() >= 3000) flush();
   html += F("'><small>Use 0 to apply the full runtime reduction. A minimum of 5 keeps a five-minute schedule at five minutes even when the Global Runtime Factor is lower.</small></div>");
   html += F("<div class='row'><label>Actual Rain Skip Above (mm)</label><input class='in-sm' type='number' step='0.1' min='0' max='200' name='smartActualRainMm' value='");
   html += String(smartActualRainSkipMm, 1); html += F("'><small>Light-rain adjustment up to this amount (%)</small><input class='in-sm' type='number' min='-100' max='300' name='smartLightRainPct' value='");
-  if (html.length() >= 3000) flush();
   html += String(smartLightRainAdjustPct); html += F("'></div>");
-  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>Forecast Rain Skip Above (mm)</label><input class='in-sm' type='number' step='0.1' min='0' max='200' name='smartForecastRainMm' value='");
   html += String(smartForecastRainSkipMm, 1); html += F("'><small>Forecast total for the next 24 hours</small></div>");
-  if (html.length() >= 3000) flush();
   html += F("</div>");
   html += F("<div>");
   html += F("<div class='subhead'>Ground Moisture</div><hr class='hr'>");
   html += F("<div class='row switchline'><label>Enable Ground Moisture</label><input type='checkbox' name='moistureProbeEnabled' ");
   html += (moistureProbeEnabled ? "checked" : "");
-  if (html.length() >= 3000) flush();
   html += F("><small>Wet soil can skip scheduled and manual starts</small></div>");
   html += F("<div class='row'><label>Moisture Source</label><select name='moistureSource'>");
   html += F("<option value='probe'"); html += (!moistureUseMeteo ? " selected" : ""); html += F(">Physical soil moisture probe</option>");
-  if (html.length() >= 3000) flush();
   html += F("<option value='meteo'"); html += (moistureUseMeteo ? " selected" : ""); html += F(">Open-Meteo Soil Moisture (0-1 cm)</option>");
-  if (html.length() >= 3000) flush();
   html += F("</select><small>Open-Meteo uses your forecast coordinates and automatic model selection. Modelled volumetric water content: 0.30 m3/m3 = 30%. Review the skip threshold for this source. GPIO and Dry/Wet calibration apply only to the physical probe.</small></div>");
   #if defined(CONFIG_IDF_TARGET_ESP32)
     html += F("<div class='row'><label>Moisture Probe GPIO</label><input class='in-xs' type='number' min='-1' max='39' name='moisturePin' value='");
     html += String(moisturePin); html += F("'><small>ADC1 pin, ESP32 GPIO32-39, or -1 disabled</small></div>");
-  if (html.length() >= 3000) flush();
+
   #else
     html += F("<div class='row'><label>Moisture Probe GPIO</label><input class='in-xs' type='number' min='-1' max='20' name='moisturePin' value='");
     html += String(moisturePin); html += F("'><small>ADC pin, ESP32-S3 GPIO1-20, or -1 disabled</small></div>");
-  if (html.length() >= 3000) flush();
+
   #endif
   html += F("<div class='row'><label>Current Moisture</label><div class='chip' id='moistureLiveRaw'>Raw: ");
   if (setupMoistureRaw < 0) html += F("--");
   else html += String(setupMoistureRaw);
   html += F("</div><div class='chip' id='moistureLivePct'>");
   html += moistureUseMeteo ? F("Water volume: ") : F("Wet: ");
-  if (html.length() >= 3000) flush();
+
   if (setupMoisturePct < 0) html += F("--");
   else { html += String(setupMoisturePct); html += F("%"); }
   html += F("</div><small id='moistureLiveHint'>");
@@ -8362,15 +8329,12 @@ void handleSetupPage() {
   html += F("</small></div>");
   html += F("<div class='row'><label>Moisture Raw Dry</label><input class='in-sm' type='number' min='0' max='4095' name='moistureDryRaw' value='");
   html += String(moistureDryRaw);
-  if (html.length() >= 3000) flush();
   html += F("'><small>Raw ADC value measured in dry soil</small></div>");
   html += F("<div class='row'><label>Moisture Raw Wet</label><input class='in-sm' type='number' min='0' max='4095' name='moistureWetRaw' value='");
   html += String(moistureWetRaw);
-  if (html.length() >= 3000) flush();
   html += F("'><small>Raw ADC value measured in wet soil</small></div>");
   html += F("<div class='row'><label>Moisture Skip Above (%)</label><input class='in-sm' type='number' min='0' max='100' name='moistureSkipPct' value='");
   html += String(moistureSkipThresholdPct);
-  if (html.length() >= 3000) flush();
   html += F("'><small>Skip starts at or above this level. Open-Meteo uses volumetric water percentage.</small></div>");
   html += F("</div>");
   html += F("</div></div></details></div>");
@@ -8380,13 +8344,9 @@ void handleSetupPage() {
   html += F("<div class='card narrow' id='rain-card'><details class='collapse'><summary>Rain Inputs</summary><div class='collapse-body'><p class='card-intro'>Choose which rain sources can stop or delay irrigation. Open-Meteo uses the forecast location below; the physical sensor uses the GPIO here.</p>");
   html += F("<div class='row switchline'><label>Disable Open-Meteo Rain</label><input type='checkbox' name='rainForecastDisabled' ");
   html += (!rainDelayFromForecastEnabled ? "checked" : ""); html += F("><small>Checked = forecast rain will not block starts</small></div>");
-  if (html.length() >= 3000) flush();
   html += F("<div class='row switchline'><label>Use Physical Rain Sensor</label><input type='checkbox' name='rainSensorEnabled' "); html += (rainSensorEnabled?"checked":""); html += F("></div>");
-  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>Rain Sensor GPIO</label><input class='in-xs' type='number' min='0' max='"); html += String(uiMaxGpio); html += F("' name='rainSensorPin' value='"); html += String(rainSensorPin); html += F("'><small>e.g. 27</small></div>");
-  if (html.length() >= 3000) flush();
   html += F("<div class='row switchline'><label>Invert Sensor</label><input type='checkbox' name='rainSensorInvert' "); html += (rainSensorInvert?"checked":""); html += F("><small>Use if board is NO</small></div>");
-  if (html.length() >= 3000) flush();
   html += F("</div></details></div>");
 
   flush();
@@ -8394,70 +8354,44 @@ void handleSetupPage() {
   html += F("<div class='card narrow' id='weather-card'><details class='collapse'><summary>Forecast Location & Model</summary><div class='collapse-body'><p class='card-intro'>Enter the irrigation site coordinates and choose the Open-Meteo forecast model used for dashboard weather, rain delay, wind delay, and Smart Watering.</p>");
   html += F("<div class='row'><label>Open-Meteo</label><a class='btn-alt' id='setupMeteoLink' href='https://open-meteo.com/en/docs?latitude=");
   html += (isfinite(meteoLat) ? String(meteoLat, 6) : String("-35.107600"));
-  if (html.length() >= 3000) flush();
   html += F("&longitude=");
   html += (isfinite(meteoLon) ? String(meteoLon, 6) : String("138.557300"));
-  if (html.length() >= 3000) flush();
   html += F("' target='_blank' rel='noopener'>Open forecast page</a><small>Click to open Open-Meteo using the current coordinates.</small></div>");
   String modelSel = cleanMeteoModel(meteoModel);
   bool modelIsKnown = isKnownMeteoModel(modelSel);
   html += F("<div class='row'><label>Location Name</label><input class='in-wide' type='text' name='meteoLocation' value='"); html += meteoLocation; html += F("'><small>Optional label for UI/logs</small></div>");
-  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>Latitude</label><input class='in-med' type='text' name='meteoLat' value='"); html += latStr; html += F("'><small>e.g. -35.1076</small></div>");
-  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>Longitude</label><input class='in-med' type='text' name='meteoLon' value='"); html += lonStr; html += F("'><small>e.g. 138.5573</small></div>");
-  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>Model</label><select class='in-med' name='meteoModelSelect' id='meteoModelSelect'>");
   html += F("<option value='best_match'");    html += (modelSel == "best_match" ? " selected" : ""); html += F(">Best match</option>");
-  if (html.length() >= 3000) flush();
   html += F("<option value='gfs_seamless'");  html += (modelSel == "gfs_seamless" ? " selected" : ""); html += F(">GFS seamless</option>");
-  if (html.length() >= 3000) flush();
   html += F("<option value='icon_seamless'"); html += (modelSel == "icon_seamless" ? " selected" : ""); html += F(">ICON seamless</option>");
-  if (html.length() >= 3000) flush();
   html += F("<option value='ecmwf_ifs025'");  html += (modelSel == "ecmwf_ifs025" ? " selected" : ""); html += F(">ECMWF IFS 0.25</option>");
-  if (html.length() >= 3000) flush();
   html += F("<option value='meteofrance_seamless'"); html += (modelSel == "meteofrance_seamless" ? " selected" : ""); html += F(">Meteo-France seamless</option>");
-  if (html.length() >= 3000) flush();
   html += F("<option value='jma_seamless'");  html += (modelSel == "jma_seamless" ? " selected" : ""); html += F(">JMA seamless</option>");
-  if (html.length() >= 3000) flush();
   html += F("<option value='cma_grapes_global'"); html += (modelSel == "cma_grapes_global" ? " selected" : ""); html += F(">CMA GRAPES global</option>");
-  if (html.length() >= 3000) flush();
   html += F("<option value='gem_seamless'");  html += (modelSel == "gem_seamless" ? " selected" : ""); html += F(">GEM seamless</option>");
-  if (html.length() >= 3000) flush();
   html += F("<option value='bom_access_global'"); html += (modelSel == "bom_access_global" ? " selected" : ""); html += F(">bom_access_global</option>");
-  if (html.length() >= 3000) flush();
   html += F("<option value='ukmo_seamless'"); html += (modelSel == "ukmo_seamless" ? " selected" : ""); html += F(">UKMO seamless</option>");
-  if (html.length() >= 3000) flush();
   html += F("<option value='icon_global'");   html += (modelSel == "icon_global" ? " selected" : ""); html += F(">ICON global</option>");
-  if (html.length() >= 3000) flush();
   html += F("<option value='icon_eu'");       html += (modelSel == "icon_eu" ? " selected" : ""); html += F(">ICON EU</option>");
-  if (html.length() >= 3000) flush();
   html += F("<option value='custom'");        html += (!modelIsKnown ? " selected" : ""); html += F(">custom</option>");
-  if (html.length() >= 3000) flush();
   html += F("</select><small>Open-Meteo forecast model</small></div>");
   html += F("<div class='row'><label>Temp/Humidity Source</label><select class='in-med' name='climateSource'>");
   html += F("<option value='meteo'"); html += (climateSource == CLIMATE_OPEN_METEO ? " selected" : ""); html += F(">Open-Meteo</option>");
-  if (html.length() >= 3000) flush();
   html += F("<option value='aht20'"); html += (climateSource == CLIMATE_AHT20_I2C ? " selected" : ""); html += F(">AHT20/AHT21 on I2C</option>");
-  if (html.length() >= 3000) flush();
   html += F("<option value='dht22'"); html += (climateSource == CLIMATE_DHT22_GPIO ? " selected" : ""); html += F(">DHT22/AM2302 on GPIO</option>");
-  if (html.length() >= 3000) flush();
   html += F("</select><small>Local sensors supply current temperature/humidity. Smart Watering uses the selected Temperature Basis; forecast sources still use Open-Meteo.</small></div>");
   html += F("<div class='row'><label>Temperature Unit</label><select class='in-sm' name='tempUnit' id='tempUnitSelect'>");
   html += F("<option value='C'"); html += (!tempUseFahrenheit ? " selected" : ""); html += F(">Celsius (C)</option>");
-  if (html.length() >= 3000) flush();
   html += F("<option value='F'"); html += (tempUseFahrenheit ? " selected" : ""); html += F(">Fahrenheit (F)</option></select><small>Dashboard, screen, and Smart Watering thresholds</small></div>");
-  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>DHT22 GPIO</label><input class='in-xs' type='number' min='-1' max='");
   html += String(uiMaxGpio); html += F("' name='dhtSensorPin' value='"); html += String(dhtSensorPin);
-  if (html.length() >= 3000) flush();
   html += F("'><small>Use -1 when disconnected. AM2302 uses the same DHT22 setting.</small></div>");
   html += F("<div class='row' id='meteoModelCustomRow' style='display:");
   html += (modelIsKnown ? "none" : "flex");
-  if (html.length() >= 3000) flush();
   html += F("'><label>Custom Model</label><input class='in-med' type='text' name='meteoModelCustom' value='");
   html += (modelIsKnown ? "" : modelSel);
-  if (html.length() >= 3000) flush();
   html += F("'><small>Use an Open-Meteo models value, e.g. gfs_seamless</small></div>");
   html += F("<div class='row helptext'><label></label><small>No API key required. Enter your coordinates for Open-Meteo.</small></div>");
   html += F("</div></details></div>");
@@ -8470,23 +8404,18 @@ void handleSetupPage() {
   html += F("<div class='row switchline'>");
   html += F("<label>Mode</label>");
   html += F("<div class='inline-options'>");
-
   html += F("<label class='chip'>");
   html += F("<input type='radio' name='tzMode' value='0' ");
   html += (tzMode==TZ_POSIX ? "checked" : "");
-  if (html.length() >= 3000) flush();
   html += F(" id='tzModePosix'>");
   html += F("<span>POSIX string</span>");
   html += F("</label>");
-
   html += F("<label class='chip'>");
   html += F("<input type='radio' name='tzMode' value='2' ");
   html += (tzMode==TZ_FIXED ? "checked" : "");
-  if (html.length() >= 3000) flush();
   html += F(">");
   html += F("<span>Fixed offset</span>");
   html += F("</label>");
-
   html += F("</div></div>"); // end row + inline-options
 
   // POSIX string input
@@ -8494,7 +8423,6 @@ void handleSetupPage() {
   html += F("<label>Timezone</label>");
   html += F("<input class='in-wide' type='text' name='tzPosix' value='");
   html += tzPosix;
-  if (html.length() >= 3000) flush();
   html += F("' placeholder='ACST-9:30ACDT,M10.1.0,M4.1.0/3'>");
   html += F("</div>");
 
@@ -8554,10 +8482,8 @@ void handleSetupPage() {
   html += F("</select>");
   html += F("</div>");
   html += F("</div>");
-
   html += F("<div class='row'><label>Fixed Offset (min)</label><input class='in-sm' type='number' name='tzFixed' value='");
   html += String(tzFixedOffsetMin);
-  if (html.length() >= 3000) flush();
   html += F("'><small>Minutes from UTC</small></div>");
   html += F("</div></details></div>"); // end Timezone card
 
@@ -8567,45 +8493,33 @@ void handleSetupPage() {
   html += F("<div class='row'><label>Display</label><select class='in-med' name='displayType' id='displayTypeSelect'>");
   html += F("<option value='none'");
   html += (!displayEnabled ? " selected" : "");
-  if (html.length() >= 3000) flush();
   html += F(">Disabled</option>");
   html += F("<option value='tft'");
   html += (displayEnabled && displayUseTft ? " selected" : "");
-  if (html.length() >= 3000) flush();
   html += F(">TFT (ST7789)</option>");
   html += F("<option value='oled'");
   html += (displayEnabled && !displayUseTft ? " selected" : "");
-  if (html.length() >= 3000) flush();
   html += F(">OLED (SSD1306)</option></select><small>Applied after reboot</small></div>");
   html += F("<div class='row'><label>Clock Format</label><select class='in-sm' name='clockFormat'>");
   html += F("<option value='24'");
   html += (clockUse24Hour ? " selected" : "");
-  if (html.length() >= 3000) flush();
   html += F(">24 hour</option>");
   html += F("<option value='12'");
   html += (!clockUse24Hour ? " selected" : "");
-  if (html.length() >= 3000) flush();
   html += F(">12 hour</option></select><small>Controls the clock shown on the screen</small></div>");
   html += F("<div class='row' data-tft-only><label>TFT Rotation</label><select class='in-sm' name='tftRotation'>");
   html += F("<option value='0'"); html += (tftRotation == 0 ? " selected" : ""); html += F(">0</option>");
-  if (html.length() >= 3000) flush();
   html += F("<option value='1'"); html += (tftRotation == 1 ? " selected" : ""); html += F(">1</option>");
-  if (html.length() >= 3000) flush();
   html += F("<option value='2'"); html += (tftRotation == 2 ? " selected" : ""); html += F(">2</option>");
-  if (html.length() >= 3000) flush();
   html += F("<option value='3'"); html += (tftRotation == 3 ? " selected" : ""); html += F(">3</option>");
-  if (html.length() >= 3000) flush();
   html += F("</select><small>ST7789 screen orientation (0-3)</small></div>");
   html += F("<div class='row' data-tft-only><label>TFT Size</label><div class='field'><input class='in-xs' type='number' min='120' max='400' name='tftWidth' value='");
   html += String(tftPanelWidth);
-  if (html.length() >= 3000) flush();
   html += F("'><span>x</span><input class='in-xs' type='number' min='120' max='400' name='tftHeight' value='");
   html += String(tftPanelHeight);
-  if (html.length() >= 3000) flush();
   html += F("'></div><small>Saved panel size. Common ST7789 sizes: 170x320, 240x320, 240x240. Applied after reboot.</small></div>");
   html += F("<div class='row switchline' data-tft-only><label>Auto Backlight (LDR)</label><input type='checkbox' name='photoAuto' ");
   html += (photoAutoEnabled ? "checked" : "");
-  if (html.length() >= 3000) flush();
   html += F("><small>Turn off TFT when it is dark</small></div>");
   if (tftBlPin < 0) {
     html += F("<div class='row helptext' data-tft-only><label></label><small>No BL pin set; will use display sleep (backlight stays on).</small></div>");
@@ -8618,21 +8532,17 @@ void handleSetupPage() {
   #if defined(CONFIG_IDF_TARGET_ESP32)
     html += F("<div class='row' data-tft-only><label>Photo GPIO</label><input class='in-xs' type='number' min='32' max='39' name='photoPin' value='");
     html += String(photoPin);
-  if (html.length() >= 3000) flush();
     html += F("'><small>ADC1 pin (ESP32: GPIO32-39)</small></div>");
   #else
     html += F("<div class='row' data-tft-only><label>Photo-Resistor GPIO</label><input class='in-xs' type='number' min='1' max='40' name='photoPin' value='");
     html += String(photoPin);
-  if (html.length() >= 3000) flush();
     html += F("'><small>ESP32-S3 photo input range: GPIO1-40</small></div>");
   #endif
   html += F("<div class='row' data-tft-only><label>Dark Threshold</label><input class='in-sm' type='number' min='0' max='4095' name='photoThreshold' value='");
   html += String(photoThreshold);
-  if (html.length() >= 3000) flush();
   html += F("'><small>ADC raw value where screen turns off</small></div>");
   html += F("<div class='row switchline' data-tft-only><label>Invert Sensor</label><input type='checkbox' name='photoInvert' ");
   html += (photoInvert ? "checked" : "");
-  if (html.length() >= 3000) flush();
   html += F("><small>Enable if your LDR reads higher when dark</small></div>");
   html += F("</div></details></div>");
 
@@ -8641,7 +8551,6 @@ void handleSetupPage() {
   html += F("<div class='card narrow' id='advanced-card' data-tft-only><details class='collapse'><summary>TFT Display Pins</summary><div class='collapse-body'><p class='card-intro'>Advanced TFT SPI and backlight pin mapping. These pins are only used when Display is set to TFT.</p>");
   html += F("<div class='row'><label>TFT Size</label><div class='chip'>");
   html += String(tftPanelWidth); html += "x"; html += String(tftPanelHeight);
-  if (html.length() >= 3000) flush();
   html += F("</div><small>Saved display geometry</small></div>");
   html += F("<datalist id='tftPins'>");
   for (int p = 1; p <= uiMaxGpio; ++p) {
@@ -8655,40 +8564,28 @@ void handleSetupPage() {
   html += F("</datalist>");
   html += F("<div class='row'><label>SCK</label><input class='in-xs' type='number' min='1' max='");
   html += String(uiMaxGpio);
-  if (html.length() >= 3000) flush();
   html += F("' list='tftPins' name='tftSclk' value='");
   html += String(tftSclkPin); html += F("'></div>");
-  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>MOSI</label><input class='in-xs' type='number' min='1' max='");
   html += String(uiMaxGpio);
-  if (html.length() >= 3000) flush();
   html += F("' list='tftPins' name='tftMosi' value='");
   html += String(tftMosiPin); html += F("'></div>");
-  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>CS</label><input class='in-xs' type='number' min='1' max='");
   html += String(uiMaxGpio);
-  if (html.length() >= 3000) flush();
   html += F("' list='tftPins' name='tftCs' value='");
   html += String(tftCsPin); html += F("'></div>");
-  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>DC</label><input class='in-xs' type='number' min='1' max='");
   html += String(uiMaxGpio);
-  if (html.length() >= 3000) flush();
   html += F("' list='tftPins' name='tftDc' value='");
   html += String(tftDcPin); html += F("'></div>");
-  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>RST</label><input class='in-xs' type='number' min='-1' max='");
   html += String(uiMaxGpio);
-  if (html.length() >= 3000) flush();
   html += F("' list='tftPinsOrNone' name='tftRst' value='");
   html += String(tftRstPin); html += F("'><small>-1 = not used</small></div>");
-  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>BL</label><input class='in-xs' type='number' min='-1' max='");
   html += String(uiMaxGpio);
-  if (html.length() >= 3000) flush();
   html += F("' list='tftPinsOrNone' name='tftBl' value='");
   html += String(tftBlPin); html += F("'><small>-1 = not used</small></div>");
-  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>LCD Brightness (%)</label><input class='in-xs' type='number' id='tftLevel' min='0' max='100' value='100'><button class='btn' type='button' id='btn-tft-bright'>Set</button></div>");
   html += F("<div class='row'><label>Self-Test</label><div class='field'>");
   html += F("<button class='btn-alt' type='button' id='tftSelfTestBtn'>TFT Self-Test</button>");
@@ -8700,7 +8597,6 @@ void handleSetupPage() {
   #else
     html += F("Use output-capable GPIO 1-");
     html += String(uiMaxGpio);
-  if (html.length() >= 3000) flush();
     html += F(" excluding 19/20 (USB), 0/45/46 (strapping), 9-14 & 35-38 (flash/PSRAM).");
   #endif
   html += F("</small></div>");
@@ -8711,10 +8607,8 @@ void handleSetupPage() {
   html += F("<div class='card narrow' id='i2c-card'><details class='collapse'><summary>I2C Relay Expander Pins</summary><div class='collapse-body'><p class='card-intro'>SDA and SCL for the PCF8574 relay expanders. Leave these alone unless your expander wiring is different.</p>");
   html += F("<div class='row'><label>SDA</label><input class='in-xs' type='number' min='0' max='48' name='i2cSda' value='");
   html += String(i2cSdaPin); html += F("'></div>");
-  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>SCL</label><input class='in-xs' type='number' min='0' max='48' name='i2cScl' value='");
   html += String(i2cSclPin); html += F("'></div>");
-  if (html.length() >= 3000) flush();
   html += F("<div class='row helptext'><label></label><small>Changing I2C pins requires reboot. Avoid strapping pins and SPI flash/PSRAM pins. KC868 boards commonly use SDA 4 and SCL 15.</small></div>");
   html += F("</div></details></div>");
 
@@ -8722,59 +8616,39 @@ void handleSetupPage() {
   html += F("<div class='card narrow' id='pins-card'><details class='collapse'><summary>Zones & Relay GPIO</summary><div class='collapse-body'><p class='card-intro'>Configure zone operation and assign direct ESP32 GPIO outputs for zone, city-water, tank, and power-supply relays.</p>");
   html += F("<div class='row'><label>Zone Count</label><input class='in-xs' type='number' min='1' max='");
   html += String(MAX_ZONES);
-  if (html.length() >= 3000) flush();
   html += F("' name='zonesMode' value='");
   html += String(zonesCount);
-  if (html.length() >= 3000) flush();
   html += F("'><small>Tank/Mains works with any zone count. Up to ");
   html += String(MAX_ZONES);
-  if (html.length() >= 3000) flush();
   html += F(" zones supported.</small></div>");
   html += F("<div class='row switchline'><label>Run Mode</label>");
   html += F("<label><input type='checkbox' name='runConcurrent' "); html += (runZonesConcurrent ? "checked" : "");
-  if (html.length() >= 3000) flush();
   html += F("> Run Zones Together</label><small>Unchecked = one at a time. Ensure the power supply can handle multiple valves before enabling concurrent operation.</small></div>");
   html += F("<div class='grid'>");
   for (uint8_t i=0;i<MAX_ZONES;i++){
     html += F("<div class='row switchline'><label>Zone "); html += String(i+1);
-  if (html.length() >= 3000) flush();
     html += F(" GPIO</label><input class='in-xs' type='number' min='-1' max='"); html += String(uiMaxGpio); html += F("' name='zonePin"); html += String(i);
-  if (html.length() >= 3000) flush();
     html += F("' value='"); html += String(zonePins[i]); html += F("'>");
-  if (html.length() >= 3000) flush();
     html += F("<label class='chip'><input type='checkbox' name='zonePinLow"); html += String(i); html += F("' ");
-  if (html.length() >= 3000) flush();
     html += (zoneGpioActiveLow[i] ? "checked" : "");
-  if (html.length() >= 3000) flush();
     html += F("><span>LOW = ON</span></label><small>-1 = unused</small></div>");
   }
   html += F("<div class='row helptext'><label></label><small>Use output-capable GPIOs only. Avoid boot strapping pins, flash pins, and any pins already used by display, I2C, sensors, or buttons.</small></div>");
   html += F("<div class='row switchline'><label>City Water Relay GPIO</label><input class='in-xs' type='number' min='-1' max='"); html += String(uiMaxGpio); html += F("' name='mainsPin' value='");
-  if (html.length() >= 3000) flush();
   html += String(mainsPin); html += F("'><label class='chip'><input type='checkbox' name='mainsPinLow' ");
-  if (html.length() >= 3000) flush();
   html += (mainsGpioActiveLow ? "checked" : "");
-  if (html.length() >= 3000) flush();
   html += F("><span>LOW = ON</span></label><small>-1 disables. City water relay. Use a check/backflow prevention device.</small></div>");
   html += F("<div class='row switchline'><label>Tank Relay GPIO</label><input class='in-xs' type='number' min='-1' max='"); html += String(uiMaxGpio); html += F("' name='tankPin' value='");
-  if (html.length() >= 3000) flush();
   html += String(tankPin); html += F("'><label class='chip'><input type='checkbox' name='tankPinLow' ");
-  if (html.length() >= 3000) flush();
   html += (tankGpioActiveLow ? "checked" : "");
-  if (html.length() >= 3000) flush();
   html += F("><span>LOW = ON</span></label><small>-1 disables. Tank pump/source relay output.</small></div>");
   html += F("<div class='row switchline'><label>Power Supply Relay GPIO</label><input class='in-xs' type='number' min='-1' max='"); html += String(uiMaxGpio); html += F("' name='powerSupplyPin' value='");
-  if (html.length() >= 3000) flush();
   html += String(powerSupplyPin); html += F("'><label class='chip'><input type='checkbox' name='powerSupplyPinLow' ");
-  if (html.length() >= 3000) flush();
   html += (powerSupplyActiveLow ? "checked" : "");
-  if (html.length() >= 3000) flush();
   html += F("><span>LOW = ON</span></label><small>-1 disables. Turns on while any zone or source relay is active.</small></div>");
   html += F("<div class='row'><label>Legacy Default</label><div class='chip'>");
   html += (gpioActiveLow ? "LOW = ON" : "HIGH = ON");
-  if (html.length() >= 3000) flush();
   html += F("</div><small>Used only when loading older saved configs that do not have per-pin polarity values yet.</small></div>");
-
   html += F("</div>");
   html += F("<div class='row' style='justify-content:flex-end;gap:8px'>");
   html += F("<button class='btn' type='submit'>Save</button>");
@@ -8785,18 +8659,13 @@ void handleSetupPage() {
   // Manual buttons
   html += F("<div class='card narrow' id='buttons-card'><details class='collapse'><summary>Physical Button Pins</summary><div class='collapse-body'><p class='card-intro'>Optional input pins for local controls. Buttons use INPUT_PULLUP, so wire the button to pull the pin LOW when pressed.</p>");
   html += F("<div class='row switchline'><label>Select Button GPIO</label><input class='in-xs' type='number' min='-1' max='"); html += String(uiMaxGpio); html += F("' name='manualSelectPin' value='");
-  if (html.length() >= 3000) flush();
   html += String(manualSelectPin);
-  if (html.length() >= 3000) flush();
   html += F("'><small>-1 to disable. Uses INPUT_PULLUP; press = LOW.</small></div>");
   html += F("<div class='row switchline'><label>Start/Stop Button GPIO</label><input class='in-xs' type='number' min='-1' max='"); html += String(uiMaxGpio); html += F("' name='manualStartPin' value='");
-  if (html.length() >= 3000) flush();
   html += String(manualStartPin);
-  if (html.length() >= 3000) flush();
   html += F("'><small>Toggles the selected zone on/off.</small></div>");
   html += F("<div class='row'><label>Selected Zone</label><div class='sub'>");
   html += zoneNames[manualSelectedZone % zonesCount];
-  if (html.length() >= 3000) flush();
   html += F(" (cycles with Select button)</div></div>");
   html += F("</div></details></div>");
 
@@ -8808,23 +8677,21 @@ void handleSetupPage() {
   for (int i = 0; i < NO_WATER_PERIODS; ++i) {
     String key = String("noWater") + i;
     html += F("<fieldset><legend>Period "); html += i + 1; html += F("</legend><label><input type='checkbox' name='"); html += key + "Enabled";
-  if (html.length() >= 3000) flush();
     html += "'"; if (noWaterEnabled[i]) html += " checked"; html += F("> Enabled</label><div class='row'>");
-  if (html.length() >= 3000) flush();
+
     for (int d = 0; d < 7; ++d) {
       html += F("<label style='min-width:70px'><input type='checkbox' name='"); html += key + "Day" + d; html += "'";
-  if (html.length() >= 3000) flush();
+
       if (noWaterDays[i] & (1 << d)) html += " checked";
       html += "> "; html += noWaterDayNames[d]; html += "</label>";
-  if (html.length() >= 3000) flush();
+
     }
     char start[6], end[6];
     snprintf(start, sizeof(start), "%02d:%02d", noWaterStart[i] / 60, noWaterStart[i] % 60);
     snprintf(end, sizeof(end), "%02d:%02d", noWaterEnd[i] / 60, noWaterEnd[i] % 60);
     html += F("</div><div class='row'><label>Start <input type='time' required name='"); html += key + "Start"; html += "' value='"; html += start;
-  if (html.length() >= 3000) flush();
     html += F("'></label><label>End <input type='time' required name='"); html += key + "End"; html += "' value='"; html += end; html += F("'></label></div></fieldset>");
-  if (html.length() >= 3000) flush();
+
   }
   html += F("</div></details></div>");
   flush();
@@ -8834,33 +8701,26 @@ void handleSetupPage() {
   // Escaping a 4 KB custom stylesheet can expand it to 24 KB.
   for (size_t pos = 0; pos < scheduleHtmlCustomCss.length(); pos += 256) {
     html += htmlEscape(scheduleHtmlCustomCss.substring(pos, pos + 256));
-    if (html.length() >= 3000) flush();
+
   }
-  if (html.length() >= 3000) flush();
+
   html += F("</textarea><small>Up to 4096 characters. Leave blank to use only the built-in styles.</small></div></div></details></div>");
 
   flush();
   // MQTT
   html += F("<div class='card narrow' id='mqtt-card'><details class='collapse'><summary>MQTT Integration</summary><div class='collapse-body'><p class='card-intro'>Publish controller status and accept simple commands from Home Assistant or another MQTT client.</p>");
   html += F("<div class='row switchline'><label>Enable MQTT</label><input type='checkbox' name='mqttEnabled' "); html += (mqttEnabled ? "checked" : ""); html += F("></div>");
-  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>Broker Host</label><input class='in-wide' type='text' name='mqttBroker' value='"); html += mqttBroker; html += F("'></div>");
-  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>Port</label><input class='in-xs' type='number' name='mqttPort' value='"); html += String(mqttPort); html += F("'></div>");
-  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>User</label><input class='in-med' type='text' name='mqttUser' value='"); html += mqttUser; html += F("'></div>");
-  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>Password</label><input class='in-med' type='text' name='mqttPass' value='"); html += mqttPass; html += F("'></div>");
-  if (html.length() >= 3000) flush();
   html += F("<div class='row'><label>Base Topic</label><input class='in-med' type='text' name='mqttBase' value='"); html += mqttBase; html += F("'><small>e.g. espirrigation</small></div>");
-  if (html.length() >= 3000) flush();
   html += F("</div></details></div>");
 
 #if ENABLE_OTA
   html += F("<div class='card narrow' id='ota-card'><details class='collapse'><summary>Firmware Updates</summary><div class='collapse-body'><p class='card-intro'>Install a compiled application image directly from a browser, with ArduinoOTA retained as a second network update method.</p>");
   html += F("<div class='row'><label>Browser OTA</label><div class='sub'>");
   html += otaPassword.length() ? F("Password configured") : F("Disabled until a password is set");
-  if (html.length() >= 3000) flush();
   html += F("</div></div><div class='row'><label>OTA Username</label><div class='sub'><code>admin</code></div></div>");
   html += F("<div class='row'><label>New OTA Password</label><input class='in-med' type='password' name='otaPassword' minlength='8' maxlength='64' autocomplete='new-password' placeholder='Leave blank to keep current password'><small>8-64 characters. Used by both Browser OTA and ArduinoOTA. The current password is never displayed.</small></div>");
   html += F("<div class='row'><label>Upload Firmware</label><div><a class='btn-alt' href='/update'>Open Browser OTA</a><small>Save a new password before opening the uploader.</small></div></div>");
@@ -8873,12 +8733,10 @@ void handleSetupPage() {
   html += F("<script>");
   // Merge related sections without changing control names, IDs or form ownership.
   html += F("[['smart-card','Watering & Delays',['delays-card']],['tank-card','Water & Rain',['rain-card']],['weather-card','Forecast & Time',['timezone-card']],['pins-card','Hardware & Buttons',['i2c-card','buttons-card']],['display-card','Display & TFT Pins',['advanced-card']]].forEach(([id,title,children])=>{const parent=document.getElementById(id);if(!parent)return;parent.querySelector('summary').textContent=title;const body=parent.querySelector('.collapse-body');children.forEach(childId=>{const child=document.getElementById(childId);if(!child)return;const heading=document.createElement('h3');heading.textContent=child.querySelector('summary').textContent;const content=child.querySelector('.collapse-body');const section=document.createElement('section');section.id=childId;section.className='setup-merged';if(child.hasAttribute('data-tft-only'))section.setAttribute('data-tft-only','');section.append(heading);while(content.firstChild)section.append(content.firstChild);body.append(section);child.remove();document.querySelector('.setup-nav a[href=\\\"#'+childId+'\\\"]')?.remove();});const link=document.querySelector('.setup-nav a[href=\\\"#'+id+'\\\"]');if(link)link.textContent=title;});");
-  if (html.length() >= 3000) flush();
   html += F("function revealSetupSection(){const id=location.hash.slice(1);const target=document.getElementById(id);if(!target||!target.closest('#setupForm'))return;let node=target;while(node){if(node.tagName==='DETAILS')node.open=true;node=node.parentElement;}const details=target.querySelector('details');if(details)details.open=true;target.scrollIntoView({block:'start'});}document.querySelector('.setup-nav').addEventListener('click',event=>{const link=event.target.closest('a');if(!link)return;event.preventDefault();history.replaceState(null,'',link.hash);revealSetupSection();});window.addEventListener('hashchange',revealSetupSection);if(location.hash)revealSetupSection();");
   html += F("async function post(path, body){try{await fetch(path,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});}catch(e){console.error(e)}}");
   html += F("const g=id=>document.getElementById(id);");
   html += F("let setupTempUnit='"); html += temperatureUnitChar(); html += F("';const tempUnitSel=g('tempUnitSelect');");
-  if (html.length() >= 3000) flush();
   html += F("tempUnitSel?.addEventListener('change',()=>{const next=tempUnitSel.value==='F'?'F':'C';if(next===setupTempUnit)return;document.querySelectorAll('[data-smart-temp]').forEach(el=>{const v=parseFloat(el.value);if(Number.isFinite(v))el.value=(next==='F'?(v*9/5+32):(v-32)*5/9).toFixed(1);});document.querySelectorAll('[data-temp-unit]').forEach(el=>el.textContent=next);setupTempUnit=next;});");
   html += F(R"SMARTJS(
 (function(){
@@ -8903,7 +8761,7 @@ void handleSetupPage() {
   update();
 })();
 )SMARTJS");
-  if (html.length() >= 3000) flush();
+
   html += F("function addRipple(e){const t=e.currentTarget; if(t.disabled) return; const rect=t.getBoundingClientRect();");
   html += F("const size=Math.max(rect.width,rect.height); const x=(e.clientX|| (rect.left+rect.width/2)) - rect.left - size/2;");
   html += F("const y=(e.clientY|| (rect.top+rect.height/2)) - rect.top - size/2;");
@@ -8917,7 +8775,6 @@ void handleSetupPage() {
   html += F("g('btn-clear-cooldown')?.addEventListener('click',async()=>{const b=g('btn-clear-cooldown');const old=b?b.textContent:'';if(b){b.disabled=true;b.textContent='Clearing...';}try{await post('/clear_cooldown','x=1');if(b)b.textContent='After-Rain Delay Cleared';setTimeout(()=>location.reload(),350);}catch(e){console.error(e);if(b){b.disabled=false;b.textContent='Clear Failed';setTimeout(()=>{b.textContent=old;},1500);}}});");
   html += F("g('btn-pause-24')?.addEventListener('click',()=>post('/pause','sec=86400'));");
   html += F("g('btn-pause-7d')?.addEventListener('click',()=>post('/pause','sec='+(7*86400)));");
-  if (html.length() >= 3000) flush();
   html += F("g('btn-resume')?.addEventListener('click',()=>post('/resume','x=1'));");
   html += F("g('btn-tft-bright')?.addEventListener('click',async()=>{const v=g('tftLevel'); if(!v) return; let n=parseInt(v.value||'100'); if(isNaN(n)) n=100; n=Math.min(100,Math.max(0,n)); v.value=n; try{await post('/tft_brightness','level='+n);}catch(e){console.error(e)}});");
   html += F("g('tftSelfTestBtn')?.addEventListener('click',async()=>{");
@@ -8928,7 +8785,6 @@ void handleSetupPage() {
   html += F("const displayTypeSel=g('displayTypeSelect');");
   html += F("function syncDisplaySetup(){const isTft=displayTypeSel&&displayTypeSel.value==='tft';document.querySelectorAll('[data-tft-only]').forEach(el=>{el.style.display=isTft?'':'none';});}");
   html += F("displayTypeSel?.addEventListener('change',syncDisplaySetup);syncDisplaySetup();");
-
   html += F(R"SETUPSTATUS(
 let setupSaving=false, setupStatusTimer=null, setupStatusRequest=null, setupStatusController=null;
 function fetchSetupStatus(){
@@ -8949,7 +8805,7 @@ async function refreshSetupStatus(){
 window.addEventListener('pagehide',()=>{setupSaving=true;clearTimeout(setupStatusTimer);setupStatusController?.abort();});
 window.addEventListener('pageshow',e=>{if(e.persisted){setupSaving=false;const b=g('btn-save-setup');if(b){b.disabled=false;b.textContent='Save Changes';}refreshSetupStatus();}});
 )SETUPSTATUS");
-  if (html.length() >= 3000) flush();
+
   html += F("async function loadTftStatus(){");
   html += F("  const el=g('tftStatusLine'); if(!el) return;");
   html += F("  try{const st=await fetchSetupStatus(); if(!st)return;");
@@ -8980,7 +8836,7 @@ window.addEventListener('pageshow',e=>{if(e.persisted){setupSaving=false;const b
 
   // === Timezone loading from Nayarsystems posix_tz_db with fallback ===
   html += F("const TZ_DB_URL='https://raw.githubusercontent.com/nayarsystems/posix_tz_db/master/zones.json';");
-  if (html.length() >= 3000) flush();
+
   html += F("const tzInput=document.getElementsByName('tzIANA')[0]||null;");
   html += F("const tzPosixInput=document.getElementsByName('tzPosix')[0]||null;");
   html += F("const tzSel=g('tzIANASelect');");
@@ -9034,7 +8890,7 @@ window.addEventListener('pageshow',e=>{if(e.persisted){setupSaving=false;const b
   // Helper to populate the select + sync inputs from a map of { IANA: POSIX }
   html += F("function buildTzOptions(zones){");
   html += F(" if(!tzSel||!tzInput) return;");
-  if (html.length() >= 3000) flush();
+
   html += F(" const current=tzInput.value||'';");
   html += F(" tzSel.innerHTML='<option value=\"\">Select from list</option>';");
 
@@ -9098,7 +8954,7 @@ window.addEventListener('pageshow',e=>{if(e.persisted){setupSaving=false;const b
   html += F("function initThemeToggle(){");
   html += F("  let saved=localStorage.getItem('theme');");
   html += F("  if(saved!=='light'&&saved!=='dark'){saved=(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light';}");
-  if (html.length() >= 3000) flush();
+
   html += F("  document.documentElement.setAttribute('data-theme', saved);");
   html += F("  const cb=document.getElementById('themeToggle');");
   html += F("  if(cb){cb.checked=(saved==='dark');cb.addEventListener('change',()=>{");
@@ -9235,8 +9091,14 @@ void handleScheduleHtml() {
   const time_t now = time(nullptr);
   struct tm today;
   const bool clockReady = now >= 1609459200 && localtime_r(&now, &today);
-  String html;
-  html.reserve(6000);
+  HttpHtmlBuffer html(server);
+  if (!html.ready()) {
+    server.send(503, "text/plain", "Not enough memory to open page. Please retry.");
+    return;
+  }
+  server.sendHeader("Cache-Control", "no-store");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/html; charset=utf-8", "");
   html += F("<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><meta http-equiv='refresh' content='60'><title>Today's Schedule</title><style>");
   html += F(":root{color-scheme:light dark}*{box-sizing:border-box}body{margin:0;padding:16px;font:15px/1.5 system-ui,sans-serif;background:#fff;color:#202b33}main{max-width:800px;margin:auto}h1{font-size:1.3rem;margin:0 0 4px}p{margin:4px 0 12px;color:#52616b}table{width:100%;border-collapse:collapse}th,td{text-align:left;vertical-align:top;padding:10px 8px;border-bottom:1px solid #dce2e6}th{overflow-wrap:anywhere}th:first-child{width:35%}.time{display:inline-block;margin-right:12px}@media(prefers-color-scheme:dark){body{background:#1c2228;color:#edf2f5}p{color:#b5c1ca}th,td{border-color:#394650}}</style>");
   if (scheduleHtmlCustomCss.length()) {
@@ -9274,8 +9136,8 @@ void handleScheduleHtml() {
     if (!any) html += F("<p class='schedule-status'>No watering scheduled today.</p>");
   }
   html += F("</main></body></html>");
-  server.sendHeader("Cache-Control", "no-store");
-  server.send(200, "text/html; charset=utf-8", html);
+  html.flush();
+  server.sendContent("");
 }
 
 static String compactRunDetailText(const String& temp, const String& hum, const String& wind, const String& cond, String city) {
@@ -9332,255 +9194,134 @@ void handleLogPage() {
   const bool hasEventLog = (bool)f;
 
   // Stream bounded chunks instead of retaining the stylesheet and table in RAM.
-  String html;
-  if (!html.reserve(7000)) {
+  HttpHtmlBuffer html(server);
+  if (!html.ready()) {
     server.send(503, "text/plain", "Not enough memory to open events. Please retry.");
     return;
   }
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/html", "");
-  auto flush = [&]() {
-    if (html.length()) { server.sendContent(html); html = ""; }
-    delay(0);
-  };
+  auto flush = [&](){ html.flush(); };
   html += F("<!doctype html><html lang='en' data-theme='light'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>");
-  if (html.length() >= 3500) flush();
   html += F("<meta name='theme-color' content='#1e40af'><meta name='color-scheme' content='light dark'>");
-  if (html.length() >= 3500) flush();
   html += F("<title>ESP32 Irrigation Events</title>");
-  if (html.length() >= 3500) flush();
   html += F("<style>");
-  if (html.length() >= 3500) flush();
   html += F(":root[data-theme='light']{--bg:#edf3ef;--bg2:#f8fbf8;--glass:rgba(255,255,255,.58);--glass-brd:rgba(122,149,140,.32);--panel:#ffffff;--line:#d3dfd9;");
-  if (html.length() >= 3500) flush();
   html += F("--card:#ffffff;--ink:#14232b;--muted:#5f736f;--primary:#2563eb;--primary-2:#1e40af;--ok:#2563eb;--warn:#c97a1a;--bad:#d9485f;");
-  if (html.length() >= 3500) flush();
   html += F("--chip:#edf4ff;--chip-brd:#c9daf5;--ring:#dcebe5;--ring2:#b4d4cb;--shadow:0 18px 40px rgba(20,47,45,.14)}");
-  if (html.length() >= 3500) flush();
   html += F(":root[data-theme='dark']{--bg:#08111f;--bg2:#0d1d21;--glass:rgba(12,28,31,.62);--glass-brd:rgba(84,123,118,.3);--panel:#0f1e22;--line:#214147;");
-  if (html.length() >= 3500) flush();
   html += F("--card:#0f1e22;--ink:#e6f0ec;--muted:#9ab4ad;--primary:#38bdf8;--primary-2:#0284c7;--ok:#60a5fa;--warn:#f0ae4d;--bad:#ff6b7d;");
-  if (html.length() >= 3500) flush();
   html += F("--chip:#10233d;--chip-brd:#24444a;--ring:#123036;--ring2:#1d5152;--shadow:0 18px 40px rgba(0,0,0,.42)}");
-  if (html.length() >= 3500) flush();
   html += F("*{box-sizing:border-box}html,body{margin:0;padding:0}");
-  if (html.length() >= 3500) flush();
   html += F("html{scroll-behavior:smooth}");
-  if (html.length() >= 3500) flush();
   html += F("body{background:radial-gradient(1200px 600px at 10% -5%,var(--bg2),transparent),radial-gradient(1200px 700px at 100% 0%,var(--ring),transparent),radial-gradient(900px 500px at -10% 80%,var(--ring2),transparent),var(--bg);");
-  if (html.length() >= 3500) flush();
   html += F("color:var(--ink);font-family:'Trebuchet MS','Candara','Segoe UI',sans-serif;line-height:1.35;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}");
-  if (html.length() >= 3500) flush();
   html += F("a{text-decoration:none;color:inherit}");
-  if (html.length() >= 3500) flush();
   html += F(".wrap{max-width:1280px;margin:20px auto;padding:0 16px}");
-  if (html.length() >= 3500) flush();
   html += F(".nav{position:sticky;top:0;z-index:10;padding:10px 12px 12px;background:linear-gradient(180deg,rgba(0,0,0,.25),transparent),var(--primary-2);box-shadow:0 16px 36px rgba(0,0,0,.25)}");
-  if (html.length() >= 3500) flush();
   html += F(".nav .in{max-width:1280px;margin:0 auto;display:flex;align-items:center;justify-content:space-between;gap:12px;color:#fff;flex-wrap:wrap}");
-  if (html.length() >= 3500) flush();
   html += F(".brand{display:flex;align-items:center;gap:8px;font-weight:800;letter-spacing:.2px;font-size:1.12rem}");
-  if (html.length() >= 3500) flush();
   html += F(".brand-copy{display:flex;flex-direction:column;gap:2px}");
-  if (html.length() >= 3500) flush();
   html += F(".brand-title{text-transform:uppercase;letter-spacing:.9px;font-size:1rem;line-height:1}");
-  if (html.length() >= 3500) flush();
   html += F(".brand-sub{font-size:.74rem;font-weight:650;color:rgba(255,255,255,.8);letter-spacing:.08em;text-transform:uppercase}");
-  if (html.length() >= 3500) flush();
   html += F(".dot{width:12px;height:12px;border-radius:999px;background:#93c5fd;box-shadow:0 0 14px #60a5fa}");
-  if (html.length() >= 3500) flush();
   html += F(".nav .meta{display:flex;gap:8px;flex-wrap:wrap;align-items:center;font-weight:650;font-size:.88rem}");
-  if (html.length() >= 3500) flush();
   html += F(".pill{display:inline-flex;align-items:center;gap:6px;background:rgba(255,255,255,.16);border:1px solid rgba(255,255,255,.28);border-radius:999px;padding:7px 12px}");
-  if (html.length() >= 3500) flush();
   html += F(".btn-ghost{background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.35);color:#fff;border-radius:10px;padding:8px 14px;font-weight:700;cursor:pointer;font-size:.92rem}");
-  if (html.length() >= 3500) flush();
   html += F(".glass{background:var(--glass);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border:1px solid var(--glass-brd);border-radius:20px;box-shadow:var(--shadow)}");
-  if (html.length() >= 3500) flush();
   html += F(".section{padding:18px}");
-  if (html.length() >= 3500) flush();
   html += F(".hero-shell{position:relative;overflow:hidden;padding:clamp(18px,3vw,30px);margin:18px 0}");
-  if (html.length() >= 3500) flush();
   html += F(".hero-shell::before,.hero-shell::after{content:'';position:absolute;border-radius:999px;pointer-events:none;filter:blur(8px)}");
-  if (html.length() >= 3500) flush();
   html += F(".hero-shell::before{width:220px;height:220px;right:-50px;top:-40px;background:radial-gradient(circle,rgba(233,173,73,.2),transparent 68%)}");
-  if (html.length() >= 3500) flush();
   html += F(".hero-shell::after{width:260px;height:260px;left:-90px;bottom:-100px;background:radial-gradient(circle,rgba(56,189,248,.2),transparent 68%)}");
-  if (html.length() >= 3500) flush();
   html += F(".hero-grid{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(320px,.85fr);gap:18px;align-items:stretch}");
-  if (html.length() >= 3500) flush();
   html += F(".hero-copy,.hero-mini-grid{position:relative;z-index:1}");
-  if (html.length() >= 3500) flush();
   html += F(".hero-copy{display:flex;flex-direction:column;justify-content:center;gap:14px}");
-  if (html.length() >= 3500) flush();
   html += F(".hero-kicker{text-transform:uppercase;letter-spacing:.22em;font-size:.72rem;font-weight:800;color:var(--primary)}");
-  if (html.length() >= 3500) flush();
   html += F(".hero-title{margin:0;font-size:clamp(1.95rem,4vw,3rem);line-height:1.02;max-width:11ch}");
-  if (html.length() >= 3500) flush();
   html += F(".hero-text{margin:0;max-width:60ch;color:var(--muted);font-size:1rem}");
-  if (html.length() >= 3500) flush();
   html += F(".hero-actions,.toolbar{display:flex;gap:10px;flex-wrap:wrap}");
-  if (html.length() >= 3500) flush();
   html += F(".hero-mini-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}");
-  if (html.length() >= 3500) flush();
   html += F(".hero-mini{min-height:132px;padding:16px;border-radius:18px;border:1px solid var(--glass-brd);background:linear-gradient(180deg,rgba(255,255,255,.58),rgba(255,255,255,.14));box-shadow:0 14px 30px rgba(19,33,68,.12);display:flex;flex-direction:column;justify-content:space-between;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}");
-  if (html.length() >= 3500) flush();
   html += F(".hero-mini.hero-mini-strong{background:linear-gradient(135deg,rgba(37,99,235,.2),rgba(96,165,250,.1))}");
-  if (html.length() >= 3500) flush();
   html += F(".hero-mini-label{text-transform:uppercase;letter-spacing:.16em;font-size:.74rem;font-weight:800;color:var(--muted)}");
-  if (html.length() >= 3500) flush();
   html += F(".hero-mini-value{font-size:1.72rem;font-weight:800;line-height:1.02;font-variant-numeric:tabular-nums}");
-  if (html.length() >= 3500) flush();
   html += F(".hero-mini-sub{color:var(--muted);font-size:.92rem}");
-  if (html.length() >= 3500) flush();
   html += F(".section-head{display:flex;align-items:flex-end;justify-content:space-between;gap:14px;max-width:1280px;margin:0 auto 14px;padding:0 2px;flex-wrap:wrap}");
-  if (html.length() >= 3500) flush();
   html += F(".section-kicker{text-transform:uppercase;letter-spacing:.18em;font-size:.72rem;font-weight:800;color:var(--primary)}");
-  if (html.length() >= 3500) flush();
   html += F(".section-head h2{margin:4px 0 0;font-size:1.35rem;line-height:1.08}");
-  if (html.length() >= 3500) flush();
   html += F(".section-note{margin:0;max-width:42ch;color:var(--muted);font-size:.92rem}");
-  if (html.length() >= 3500) flush();
   html += F(".card{background:var(--card);border:1px solid var(--glass-brd);border-radius:20px;box-shadow:var(--shadow);padding:18px;transition:transform .12s ease,box-shadow .12s ease}");
-  if (html.length() >= 3500) flush();
   html += F(".card:hover{transform:translateY(-2px);box-shadow:0 16px 34px rgba(0,0,0,.18)}");
-  if (html.length() >= 3500) flush();
   html += F(".btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;background:linear-gradient(180deg,var(--primary),var(--primary-2));color:#fff;border:1px solid rgba(0,0,0,.08);border-radius:13px;padding:11px 16px;font-weight:800;cursor:pointer;box-shadow:0 8px 20px rgba(0,0,0,.22);font-size:1rem}");
-  if (html.length() >= 3500) flush();
   html += F(".btn-secondary{background:transparent;color:var(--ink);border:1px solid var(--line);box-shadow:none}");
-  if (html.length() >= 3500) flush();
   html += F(".btn-danger{background:linear-gradient(180deg,#ef4444,#b91c1c);border-color:rgba(185,28,28,.6)}");
-  if (html.length() >= 3500) flush();
   html += F(".btn-warn{background:linear-gradient(180deg,#d97706,#92400e);border-color:rgba(146,64,14,.55)}");
-  if (html.length() >= 3500) flush();
   html += F(".btn,.btn-ghost,.pill{transition:transform .06s ease,box-shadow .06s ease,filter .06s ease;touch-action:manipulation;position:relative;overflow:hidden}");
-  if (html.length() >= 3500) flush();
   html += F(".btn:hover{filter:brightness(1.05)}");
-  if (html.length() >= 3500) flush();
   html += F(".btn:active:not(:disabled),.btn-ghost:active,.pill:active{transform:translateY(1px);box-shadow:inset 0 2px 6px rgba(0,0,0,.25)}");
-  if (html.length() >= 3500) flush();
   html += F(".btn:focus-visible,.btn-ghost:focus-visible,.pill:focus-visible{outline:2px solid var(--primary);outline-offset:2px}");
-  if (html.length() >= 3500) flush();
   html += F(".toolbar{margin:14px 0 0}");
-  if (html.length() >= 3500) flush();
   html += F(".toolbar form{display:inline-flex;margin:0}");
-  if (html.length() >= 3500) flush();
   html += F(".filter-toggle{display:inline-flex;align-items:center;gap:10px;padding:10px 14px;border-radius:14px;border:1px solid var(--glass-brd);background:rgba(255,255,255,.08);color:var(--ink);font-weight:700}");
-  if (html.length() >= 3500) flush();
   html += F(".filter-toggle input[type=checkbox]{appearance:none;-webkit-appearance:none;width:18px;height:18px;margin:0;flex:0 0 18px;display:inline-grid;place-content:center;cursor:pointer;border:1.6px solid rgba(255,255,255,.7);border-radius:6px;background:rgba(255,255,255,.06)}");
-  if (html.length() >= 3500) flush();
   html += F(".filter-toggle input[type=checkbox]::before{content:'';display:block;width:5px;height:9px;border-right:2px solid #fff;border-bottom:2px solid #fff;transform:rotate(45deg) scale(0);margin-top:-1px;transition:transform .12s ease}");
-  if (html.length() >= 3500) flush();
   html += F(".filter-toggle input[type=checkbox]:checked{border-color:#ffffff;background:transparent;box-shadow:none}");
-  if (html.length() >= 3500) flush();
   html += F(".filter-toggle input[type=checkbox]:checked::before{transform:rotate(45deg) scale(1)}");
-  if (html.length() >= 3500) flush();
   html += F(".filter-toggle input[type=checkbox]:focus-visible{outline:none;border-color:#ffffff;box-shadow:0 0 0 3px rgba(37,99,235,.2)}");
-  if (html.length() >= 3500) flush();
   html += F(".filter-toggle small{display:block;color:var(--muted);font-weight:600;font-size:.78rem}");
-  if (html.length() >= 3500) flush();
   html += F(".table-wrap{overflow:auto;border-radius:18px;border:1px solid var(--glass-brd);background:linear-gradient(180deg,rgba(255,255,255,.18),rgba(255,255,255,.05));box-shadow:var(--shadow)}");
-  if (html.length() >= 3500) flush();
   html += F("table{width:100%;border-collapse:separate;border-spacing:0;min-width:820px}");
-  if (html.length() >= 3500) flush();
   html += F("th,td{padding:12px 14px;border-bottom:1px solid var(--line);font-size:.94rem;text-align:left;white-space:nowrap;vertical-align:top}");
-  if (html.length() >= 3500) flush();
   html += F("th{position:sticky;top:0;z-index:1;background:rgba(30,64,175,.92);color:#fff;text-transform:uppercase;letter-spacing:.08em;font-size:.75rem}");
-  if (html.length() >= 3500) flush();
   html += F("tbody tr{background:rgba(255,255,255,.04)}");
-  if (html.length() >= 3500) flush();
   html += F("tbody tr:nth-child(even){background:rgba(255,255,255,.02)}");
-  if (html.length() >= 3500) flush();
   html += F("tbody tr:hover{background:rgba(37,99,235,.09)}");
-  if (html.length() >= 3500) flush();
   html += F("td:first-child{font-family:'JetBrains Mono','Consolas',monospace;font-size:.82rem}");
-  if (html.length() >= 3500) flush();
   html += F("td:last-child{white-space:normal;min-width:260px;color:var(--muted)}");
-  if (html.length() >= 3500) flush();
   html += F(".event-chip{display:inline-flex;align-items:center;justify-content:center;min-width:88px;padding:6px 10px;border-radius:999px;border:1px solid var(--chip-brd);font-size:.78rem;font-weight:800;letter-spacing:.08em;text-transform:uppercase}");
-  if (html.length() >= 3500) flush();
   html += F(".event-chip.start{background:rgba(37,99,235,.12);border-color:rgba(37,99,235,.3);color:var(--ok)}");
-  if (html.length() >= 3500) flush();
   html += F(".event-chip.stopped{background:rgba(217,72,95,.12);border-color:rgba(217,72,95,.32);color:var(--bad)}");
-  if (html.length() >= 3500) flush();
   html += F(".event-chip.cancelled{background:rgba(245,158,11,.12);border-color:rgba(245,158,11,.34);color:var(--warn)}");
-  if (html.length() >= 3500) flush();
   html += F(".event-chip.queued{background:rgba(56,189,248,.12);border-color:rgba(56,189,248,.32);color:var(--primary)}");
-  if (html.length() >= 3500) flush();
   html += F(".muted{color:var(--muted)}");
-  if (html.length() >= 3500) flush();
   html += F(".empty-state{padding:28px 22px;text-align:center;color:var(--muted)}");
-  if (html.length() >= 3500) flush();
   html += F(".ripple{position:absolute;border-radius:999px;transform:scale(0);background:rgba(255,255,255,.35);animation:ripple .5s ease-out;pointer-events:none}");
-  if (html.length() >= 3500) flush();
   html += F("@keyframes ripple{to{transform:scale(3.2);opacity:0;}}");
-  if (html.length() >= 3500) flush();
   html += F("html[data-theme='dark'] .hero-mini{background:linear-gradient(180deg,rgba(15,30,34,.96),rgba(15,30,34,.9));box-shadow:0 14px 30px rgba(0,0,0,.22)}");
-  if (html.length() >= 3500) flush();
   html += F("html[data-theme='dark'] .hero-mini.hero-mini-strong{background:linear-gradient(135deg,rgba(37,99,235,.18),rgba(16,39,43,.94))}");
-  if (html.length() >= 3500) flush();
   html += F("html[data-theme='dark'] .table-wrap{background:linear-gradient(180deg,rgba(12,28,31,.9),rgba(12,28,31,.72))}");
-  if (html.length() >= 3500) flush();
   html += F("html[data-theme='dark'] tbody tr{background:rgba(255,255,255,.015)}");
-  if (html.length() >= 3500) flush();
   html += F("html[data-theme='light'] .filter-toggle{background:rgba(255,255,255,.82)}");
-  if (html.length() >= 3500) flush();
   html += F("html[data-theme='light'] .filter-toggle input[type=checkbox]{border-color:#8aa59c;background:rgba(255,255,255,.78);box-shadow:inset 0 1px 0 rgba(255,255,255,.75)}");
-  if (html.length() >= 3500) flush();
   html += F("html[data-theme='light'] .filter-toggle input[type=checkbox]::before{border-right-color:#1e40af;border-bottom-color:#1e40af}");
-  if (html.length() >= 3500) flush();
   html += F("html[data-theme='light'] .filter-toggle input[type=checkbox]:checked{border-color:#2563eb;background:#ffffff;box-shadow:0 0 0 3px rgba(37,99,235,.12)}");
-  if (html.length() >= 3500) flush();
   html += F("html[data-theme='light'] th{background:rgba(30,64,175,.94)}");
-  if (html.length() >= 3500) flush();
   html += F("html[data-theme='light'] tbody tr{background:rgba(255,255,255,.8)}");
-  if (html.length() >= 3500) flush();
   html += F("html[data-theme='light'] tbody tr:nth-child(even){background:rgba(248,251,248,.92)}");
-  if (html.length() >= 3500) flush();
   html += F("@media(max-width:980px){.hero-grid{grid-template-columns:1fr}.hero-mini-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}");
-  if (html.length() >= 3500) flush();
   html += F(":root{--shadow:0 10px 28px rgba(15,23,42,.12)}:root[data-theme='light']{--bg:#f3f7fc;--bg2:#fbfdff;--glass:rgba(255,255,255,.78);--glass-brd:#d8e3dd;--line:#dbe6f3;--ring:#e6eefb;--ring2:#f3e8cf}");
-  if (html.length() >= 3500) flush();
   html += F(":root[data-theme='dark']{--bg:#0a1114;--bg2:#111d21;--glass:rgba(16,29,33,.78);--glass-brd:#264148;--card:#101d21;--line:#263f45;--chip:#13282d;--chip-brd:#2b4a51;--shadow:0 12px 30px rgba(0,0,0,.34)}");
-  if (html.length() >= 3500) flush();
   html += F(":root[data-theme='light']{--bg:#f3f7fc;--bg2:#fbfdff;--glass-brd:#d7e2f0;--line:#dbe6f3;--primary:#2563eb;--primary-2:#1e40af;--chip:#edf4ff;--chip-brd:#c9daf5;--ring:#e6eefb;--ring2:#dbeafe}");
-  if (html.length() >= 3500) flush();
   html += F(":root[data-theme='dark']{--bg:#08111f;--bg2:#0d1b2f;--glass:rgba(13,27,47,.8);--glass-brd:#24405f;--card:#0f1d31;--line:#263f60;--primary:#38bdf8;--primary-2:#2563eb;--chip:#10233d;--chip-brd:#294b73}");
-  if (html.length() >= 3500) flush();
   html += F("body{background:linear-gradient(180deg,var(--bg2),var(--bg));letter-spacing:0}.hero-shell::before,.hero-shell::after{display:none}");
-  if (html.length() >= 3500) flush();
   html += F(".nav{background:linear-gradient(180deg,#1e40af,#172554);box-shadow:0 8px 22px rgba(0,0,0,.18)}.wrap{margin:16px auto}");
-  if (html.length() >= 3500) flush();
   html += F(".glass,.card,.hero-mini,.table-wrap,.btn,.btn-ghost,.pill,.filter-toggle,.event-chip{border-radius:8px}");
-  if (html.length() >= 3500) flush();
   html += F(".hero-shell{padding:22px;background:linear-gradient(135deg,var(--glass),rgba(37,99,235,.08));border-color:var(--glass-brd)}.hero-title{font-size:clamp(1.7rem,3vw,2.45rem);max-width:none}");
-  if (html.length() >= 3500) flush();
   html += F(".hero-mini{min-height:112px;background:var(--card);box-shadow:none}.card{box-shadow:0 8px 24px rgba(15,23,42,.08)}.card:hover{transform:none;box-shadow:0 10px 28px rgba(15,23,42,.12)}");
-  if (html.length() >= 3500) flush();
   html += F(".table-wrap{box-shadow:0 8px 24px rgba(15,23,42,.08)}th{background:#1e40af}tbody tr:hover{background:rgba(37,99,235,.09)}td:last-child{min-width:320px}.btn{box-shadow:0 6px 16px rgba(37,99,235,.22)}");
-  if (html.length() >= 3500) flush();
   html += F(".event-chip.queued{background:rgba(37,99,235,.12);border-color:rgba(37,99,235,.32);color:var(--primary)}.filter-toggle input[type=checkbox]:focus-visible{box-shadow:0 0 0 3px rgba(37,99,235,.2)}");
-  if (html.length() >= 3500) flush();
   html += F("html[data-theme='light'] .filter-toggle input[type=checkbox]::before{border-right-color:#1e40af;border-bottom-color:#1e40af}html[data-theme='light'] .filter-toggle input[type=checkbox]:checked{border-color:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,.12)}");
-  if (html.length() >= 3500) flush();
   html += F("html[data-theme='light'] th{background:#1e40af}");
-  if (html.length() >= 3500) flush();
   html += F("html[data-theme='dark'] .hero-mini{background:#102126}html[data-theme='dark'] .table-wrap{box-shadow:0 12px 30px rgba(0,0,0,.34)}");
-  if (html.length() >= 3500) flush();
   html += F(".hero-shell{padding:16px 18px;margin:12px 0 14px}.hero-grid{grid-template-columns:minmax(0,.78fr) minmax(520px,1.22fr);gap:16px;align-items:center}.hero-copy{gap:10px}.hero-kicker{letter-spacing:.12em;font-size:.66rem}.hero-title{font-size:clamp(1.55rem,2.4vw,2.15rem);line-height:1.08}.hero-text{font-size:.92rem;max-width:48ch}.hero-actions{gap:8px}.hero-actions .btn{padding:9px 13px;font-size:.9rem;min-width:92px}.hero-mini-grid{grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}.hero-mini{min-height:82px;padding:10px 12px;border-left:0;border-top:2px solid var(--line)}.hero-mini.hero-mini-strong{border-top-color:var(--primary)}.hero-mini-label{font-size:.62rem;letter-spacing:.1em}.hero-mini-value{font-size:1.28rem;line-height:1}.hero-mini-sub{font-size:.76rem;line-height:1.22}.section-head{align-items:center;margin-bottom:9px}.section-head h2{font-size:1.16rem}.section-note{font-size:.82rem;max-width:34ch}");
-  if (html.length() >= 3500) flush();
   html += F("@media(max-width:1080px){.hero-grid{grid-template-columns:1fr}.hero-mini-grid{grid-template-columns:repeat(4,minmax(0,1fr))}}@media(max-width:760px){.hero-shell{padding:14px}.hero-mini-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.section-note{display:none}}@media(max-width:440px){.hero-mini-grid{grid-template-columns:1fr}.hero-actions{display:grid;grid-template-columns:1fr}.hero-actions .btn{width:100%}}");
-  if (html.length() >= 3500) flush();
   html += F(".log-head{display:grid;grid-template-columns:minmax(240px,.9fr) minmax(0,1.8fr);gap:14px;align-items:start;margin:12px 0 14px;padding:14px 16px}.log-title{margin:0;font-size:1.55rem;line-height:1.1}.log-copy{margin:5px 0 10px;color:var(--muted);font-size:.9rem;max-width:52ch}.log-actions{display:flex;gap:8px;flex-wrap:wrap}.log-actions .btn{padding:9px 13px;font-size:.9rem;min-width:92px}.metric-strip{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px}.metric{min-width:0;border:1px solid var(--line);border-top:2px solid var(--primary);border-radius:8px;padding:9px 10px;background:var(--panel)}.metric:nth-child(2){border-top-color:#2563eb}.metric:nth-child(3){border-top-color:#dc2626}.metric:nth-child(4){border-top-color:#3b82f6}.metric:nth-child(5){border-top-color:#0891b2}.metric:nth-child(6){border-top-color:#f59e0b}.metric-k{text-transform:uppercase;letter-spacing:.1em;font-size:.58rem;font-weight:850;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.metric-v{margin-top:4px;font-size:1.18rem;line-height:1;font-weight:850;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}.metric-s{margin-top:4px;color:var(--muted);font-size:.72rem;line-height:1.18}.metric-latest{grid-column:span 2}.section-head{align-items:center;margin-bottom:9px}.section-head h2{font-size:1.16rem}.section-note{font-size:.82rem;max-width:34ch}");
-  if (html.length() >= 3500) flush();
   html += F("@media(max-width:1080px){.log-head{grid-template-columns:1fr}.metric-strip{grid-template-columns:repeat(3,minmax(0,1fr))}.metric-latest{grid-column:span 1}}@media(max-width:640px){.metric-strip{grid-template-columns:repeat(2,minmax(0,1fr))}.log-head{padding:13px}.section-note{display:none}}@media(max-width:420px){.metric-strip{grid-template-columns:1fr}.log-actions{display:grid;grid-template-columns:1fr}.log-actions .btn{width:100%}}");
-  if (html.length() >= 3500) flush();
   html += F("@media(max-width:720px){.wrap{padding:0 12px}.nav{padding:10px}.hero-mini-grid{grid-template-columns:1fr}.toolbar,.hero-actions{flex-direction:column}.toolbar form{display:flex}.btn,.btn-ghost{width:100%}.section{padding:16px}th,td{padding:10px 12px}}");
-  if (html.length() >= 3500) flush();
   html += F("@media (prefers-reduced-motion: reduce){*{animation:none!important;transition:none!important}}");
-  if (html.length() >= 3500) flush();
   html += F("</style></head><body>");
-  if (html.length() >= 3500) flush();
+
 
   int eventCount = 0;
   int startCount = 0;
@@ -9674,148 +9415,90 @@ void handleLogPage() {
 
       String details = temp.length() ? compactRunDetailText(temp, hum, wind, cond, city) : "n/a";
 
-      String row;
-      row.reserve(320);
-      row += F("<tr data-manual='"); row += (isManualRunEvent ? "1" : "0");
-      row += F("'><td>"); row += htmlEscape(ts);
-      row += F("</td><td>"); row += htmlEscape(zone);
-      row += F("</td><td><span class='event-chip ");
-      row += eventChipClass(ev);
-      row += F("'>");
-      row += eventLabel(ev, src);
-      row += F("</span>");
-      row += F("</td><td>"); row += htmlEscape(src);
-      row += F("</td><td>"); row += htmlEscape(rd);
-      row += F("</td><td>"); row += htmlEscape(details); row += F("</td></tr>");
-
-      server.sendContent(row);
+      html += F("<tr data-manual='"); html += (isManualRunEvent ? "1" : "0");
+      html += F("'><td>"); html += htmlEscape(ts);
+      html += F("</td><td>"); html += htmlEscape(zone);
+      html += F("</td><td><span class='event-chip ");
+      html += eventChipClass(ev);
+      html += F("'>");
+      html += eventLabel(ev, src);
+      html += F("</span>");
+      html += F("</td><td>"); html += htmlEscape(src);
+      html += F("</td><td>"); html += htmlEscape(rd);
+      html += F("</td><td>"); html += htmlEscape(details); html += F("</td></tr>");
       delay(0);
     }
   };
   renderEvents(false);
   html += F("<nav class='nav'><div class='in'><div class='brand'><span class='dot'></span><div class='brand-copy'><span class='brand-title'>ESP32 Irrigation</span><span class='brand-sub'>Event History</span></div></div><div class='meta'><span id='eventCountBadge' class='pill'>");
-  if (html.length() >= 3500) flush();
   html += String(eventCount);
-  if (html.length() >= 3500) flush();
   html += F(" filtered events</span><button id='themeBtn' class='btn-ghost' title='Toggle theme'>Theme</button></div></div></nav>");
-  if (html.length() >= 3500) flush();
   html += F("<div class='wrap'>");
-  if (html.length() >= 3500) flush();
   html += F("<section class='card log-head'><div><div class='section-kicker'>System History</div><h1 class='log-title'>Irrigation run log</h1><p class='log-copy'>Manual and scheduled starts and stops only. Download CSV keeps the complete log.</p><div class='log-actions'><a class='btn' href='/'>Home</a><a class='btn btn-secondary' href='/setup'>Setup</a>");
-  if (html.length() >= 3500) flush();
+
   if (hasEventLog) html += F("<a class='btn btn-secondary' href='/download/events.csv'>Download CSV</a>");
-  if (html.length() >= 3500) flush();
   html += F("</div></div><div class='metric-strip'>");
-  if (html.length() >= 3500) flush();
   html += F("<div class='metric metric-latest'><div class='metric-k'>Latest</div><div id='latestEventValue' class='metric-v'>");
-  if (html.length() >= 3500) flush();
   html += latestTs;
-  if (html.length() >= 3500) flush();
   html += F("</div><div class='metric-s'>Latest run entry</div></div>");
-  if (html.length() >= 3500) flush();
   html += F("<div class='metric'><div class='metric-k'>Starts</div><div id='startCountValue' class='metric-v'>");
-  if (html.length() >= 3500) flush();
   html += String(startCount);
-  if (html.length() >= 3500) flush();
   html += F("</div><div class='metric-s'>Run starts</div></div>");
-  if (html.length() >= 3500) flush();
   html += F("<div class='metric'><div class='metric-k'>Stops</div><div id='stopCountValue' class='metric-v'>");
-  if (html.length() >= 3500) flush();
   html += String(stopCount);
-  if (html.length() >= 3500) flush();
   html += F("</div><div class='metric-s'>Run stops</div></div>");
-  if (html.length() >= 3500) flush();
   html += F("<div class='metric'><div class='metric-k'>Manual</div><div class='metric-v'>");
-  if (html.length() >= 3500) flush();
   html += String(manualRunCount);
-  if (html.length() >= 3500) flush();
   html += F("</div><div class='metric-s'>Entries</div></div>");
-  if (html.length() >= 3500) flush();
   html += F("<div class='metric'><div class='metric-k'>Scheduled</div><div class='metric-v'>");
-  if (html.length() >= 3500) flush();
   html += String(scheduledRunCount);
-  if (html.length() >= 3500) flush();
   html += F("</div><div class='metric-s'>Entries</div></div>");
-  if (html.length() >= 3500) flush();
   html += F("<div class='metric'><div class='metric-k'>Run Time</div><div class='metric-v'>");
-  if (html.length() >= 3500) flush();
   html += manualRuntime; html += F("</div><div class='metric-s'>Manual</div></div>");
-  if (html.length() >= 3500) flush();
   html += F("<div class='metric'><div class='metric-k'>Run Time</div><div class='metric-v'>");
-  if (html.length() >= 3500) flush();
   html += schedRuntime; html += F("</div><div class='metric-s'>Scheduled</div></div>");
-  if (html.length() >= 3500) flush();
   html += F("</div></section>");
-  if (html.length() >= 3500) flush();
   html += F("<div class='section-head'><div><div class='section-kicker'>Audit Trail</div><h2>Recent runs</h2></div><p class='section-note'>Newest manual and scheduled starts and stops stay at the top.</p></div>");
-  if (html.length() >= 3500) flush();
+
   if (logTruncatedForPage) {
     html += F("<section class='card'><p class='section-note'>Showing up to 64 recent entries from the last ");
-  if (html.length() >= 3500) flush();
     html += String(logBytesShown / 1024);
-  if (html.length() >= 3500) flush();
     html += F(" KB of the event log to keep the page responsive. Use Download CSV for the complete log.</p></section>");
-  if (html.length() >= 3500) flush();
+
   }
   html += F("<section class='card'><div class='toolbar'><form method='POST' action='/clearevents'><button class='btn btn-danger' type='submit'>Clear Events</button></form><form method='POST' action='/stopall'><button class='btn btn-warn' type='submit'>Stop All</button></form><label class='filter-toggle'><input id='hideManualRuns' type='checkbox'><span>Hide Manual Starts/Stops<small>Filter manual run entries from this view</small></span></label></div><div class='table-wrap'><table><thead><tr>");
-  if (html.length() >= 3500) flush();
   html += F("<th>Time</th><th>Zone</th><th>Event</th><th>Source</th><th>Rain Delay</th><th>Details</th></tr></thead><tbody>");
-  if (html.length() >= 3500) flush();
+
   flush();
   renderEvents(true);
   if (f) f.close();
   html += F("<tr id='events-empty-row'"); html += (eventCount == 0 ? "" : " hidden");
-  if (html.length() >= 3500) flush();
   html += F("><td colspan='6' class='empty-state'>No manual or scheduled run entries are available yet. Starts and stops will appear here after the controller records them.</td></tr>");
-  if (html.length() >= 3500) flush();
   html += F("</tbody></table></div></section></div>");
-  if (html.length() >= 3500) flush();
   html += F("<script>");
-  if (html.length() >= 3500) flush();
   html += F("function applyTheme(t){document.documentElement.setAttribute('data-theme',t==='dark'?'dark':'light');}");
-  if (html.length() >= 3500) flush();
   html += F("(function(){let saved=localStorage.getItem('theme');if(saved!=='dark'&&saved!=='light'){saved=(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light';localStorage.setItem('theme',saved);}applyTheme(saved);})();");
-  if (html.length() >= 3500) flush();
   html += F("document.getElementById('themeBtn')?.addEventListener('click',()=>{const cur=(document.documentElement.getAttribute('data-theme')==='dark')?'dark':'light';const nxt=(cur==='dark')?'light':'dark';applyTheme(nxt);localStorage.setItem('theme',nxt);});");
-  if (html.length() >= 3500) flush();
   html += F("const manualFilterKey='eventsHideManualRuns';");
-  if (html.length() >= 3500) flush();
   html += F("const hideManualBox=document.getElementById('hideManualRuns');");
-  if (html.length() >= 3500) flush();
   html += F("const rows=[...document.querySelectorAll('tbody tr[data-manual]')];");
-  if (html.length() >= 3500) flush();
   html += F("function refreshEventView(){const hideManual=!!hideManualBox?.checked;let visible=0,starts=0,stops=0;let latest='-';");
-  if (html.length() >= 3500) flush();
   html += F("rows.forEach(row=>{const isManual=row.dataset.manual==='1';const keep=!(hideManual&&isManual);row.hidden=!keep;if(!keep)return;visible++;const cells=row.cells;if(visible===1&&cells[0])latest=cells[0].textContent.trim();const ev=(cells[2]?.textContent||'').trim().toUpperCase();if(ev==='START')starts++;else if(ev==='STOPPED')stops++;});");
-  if (html.length() >= 3500) flush();
   html += F("const empty=document.getElementById('events-empty-row'); if(empty) empty.hidden=visible!==0;");
-  if (html.length() >= 3500) flush();
   html += F("const badge=document.getElementById('eventCountBadge'); if(badge) badge.textContent=visible+' filtered events';");
-  if (html.length() >= 3500) flush();
   html += F("const latestEl=document.getElementById('latestEventValue'); if(latestEl) latestEl.textContent=latest;");
-  if (html.length() >= 3500) flush();
   html += F("const startEl=document.getElementById('startCountValue'); if(startEl) startEl.textContent=String(starts);");
-  if (html.length() >= 3500) flush();
   html += F("const stopEl=document.getElementById('stopCountValue'); if(stopEl) stopEl.textContent=String(stops);}");
-  if (html.length() >= 3500) flush();
   html += F("if(hideManualBox){hideManualBox.checked=localStorage.getItem(manualFilterKey)==='1';hideManualBox.addEventListener('change',()=>{localStorage.setItem(manualFilterKey,hideManualBox.checked?'1':'0');refreshEventView();});refreshEventView();}");
-  if (html.length() >= 3500) flush();
   html += F("function addRipple(e){const t=e.currentTarget; if(t.disabled) return; const rect=t.getBoundingClientRect();");
-  if (html.length() >= 3500) flush();
   html += F("const size=Math.max(rect.width,rect.height); const x=(e.clientX|| (rect.left+rect.width/2)) - rect.left - size/2;");
-  if (html.length() >= 3500) flush();
   html += F("const y=(e.clientY|| (rect.top+rect.height/2)) - rect.top - size/2;");
-  if (html.length() >= 3500) flush();
   html += F("const r=document.createElement('span'); r.className='ripple'; r.style.width=size+'px'; r.style.height=size+'px';");
-  if (html.length() >= 3500) flush();
   html += F("r.style.left=x+'px'; r.style.top=y+'px'; const old=t.querySelector('.ripple'); if(old) old.remove(); t.appendChild(r);");
-  if (html.length() >= 3500) flush();
   html += F("setTimeout(()=>{r.remove();},520);}");
-  if (html.length() >= 3500) flush();
   html += F("document.querySelectorAll('.btn,.btn-ghost').forEach(el=>{el.addEventListener('pointerdown',addRipple);});");
-  if (html.length() >= 3500) flush();
   html += F("</script></body></html>");
-  if (html.length() >= 3500) flush();
+
   flush();
   server.sendContent("");
 }
@@ -9826,7 +9509,13 @@ void handleTankCalibration() {
   int raw = readTankRaw();
   int pct = tankPercent();
 
-  String html; html.reserve(4800);
+  HttpHtmlBuffer html(server);
+  if (!html.ready()) {
+    server.send(503, "text/plain", "Not enough memory to open page. Please retry.");
+    return;
+  }
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/html", "");
   html += F("<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>");
   html += F("<title>Tank Calibration</title>");
   html += F("<style>:root{color-scheme:light dark;--bg:#f3f7fc;--panel:#fff;--ink:#172033;--muted:#68758a;--line:#dbe4ef;--blue:#2563eb;--blue-dark:#1e3a8a;--warn:#b45309}");
@@ -9856,7 +9545,8 @@ void handleTankCalibration() {
   html += F("async function update(){try{const r=await fetch('/status',{cache:'no-store'});const s=await r.json();const p=Math.max(0,Math.min(100,Number(s.tankPct)||0));document.getElementById('pct').textContent=p+'%';document.getElementById('fill').style.width=p+'%';document.getElementById('raw').textContent='Raw '+(s.tankRaw==null?'--':s.tankRaw);document.getElementById('empty').textContent=s.tankEmptyRaw==null?'--':s.tankEmptyRaw;document.getElementById('full').textContent=s.tankFullRaw==null?'--':s.tankFullRaw;}catch(e){}}update();setInterval(update,1000);");
   html += F("</script></body></html>");
 
-  server.send(200,"text/html",html);
+  html.flush();
+  server.sendContent("");
 }
 
 // ---------- Config & Schedule ----------
@@ -11002,8 +10692,8 @@ void handleConfigure() {
   };
   if (coordChanged(oldLat, meteoLat) || coordChanged(oldLon, meteoLon) || (oldLoc != meteoLocation) || (oldModel != meteoModel) || climateSourceChanged || dhtPinChanged) {
     // Clear current / forecast caches and timers
-    cachedWeatherData   = "";
-    cachedForecastData  = "";
+    cachedWeatherData = static_cast<const char*>(nullptr); // Release capacity as well as the contents.
+    forecastAvailable = false;
     lastWeatherUpdate   = 0;
     lastForecastUpdate  = 0;
     ++weatherGeneration; // Discard in-flight results from previous settings.
@@ -11175,6 +10865,7 @@ static void tickUpdateReport() {
     if (xQueueReceive(weatherResults, &token, 0) != pdTRUE) return;
     weatherBusy = false;
     const int code = weatherJob.reportCode;
+    releaseWeatherJobPayloads();
     updateReportNextAttemptMs = now + UPDATE_REPORT_RETRY_MS;
     if (code >= 200 && code < 300) {
       updateReportPending = false;

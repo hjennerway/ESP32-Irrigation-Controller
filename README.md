@@ -314,3 +314,7 @@ Home streams its complete response, including JavaScript and zone cards, through
 ## Version 3.2.2
 
 The weather summary replaces Sunrise and Sunset with Day Length and Daily Change compared with yesterday. Daylight comes from Open-Meteo daily daylight duration; yesterday is included in daily data while the hourly rain forecast stays at 24 future entries. Daily temperature and solar values are selected by date. Missing or stale daylight data is shown as --.
+
+## Version 3.2.3
+
+Setup, Events, Diagnostics, firmware upload, schedule and tank calibration pages now stream through a fixed 2 KB buffer, including individual event rows. Weather no longer preallocates 20 KB of raw JSON storage or retains a raw forecast cache. Completed worker payloads are released after their results are applied. These changes reduce memory pressure on classic ESP32 boards without PSRAM. Both updater images include the fix; flash partition layouts are unchanged.

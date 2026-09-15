@@ -8,13 +8,13 @@ function page(overrides={}){
     zoneNames:['Audrey <II> & herbs','Tomatoes','Other day'],startHour:[17,23,10],startMin:[30,50,0],startHour2:[11,0,0],startMin2:[30,0,0],enableStartTime2:[true,false,false],
     scheduleHtmlCustomCss:'',
     durationForSlot:()=>1800,smartWateringDurationForSlot:()=>1800,
-    time:()=>Date.UTC(2026,8,9,18)/1000,F:v=>v,String,sizeof:()=>40,
-    server:{sendHeader:(k,v)=>response.headers[k]=v,send:(code,type,html)=>Object.assign(response,{code,type,html})},
+    CONTENT_LENGTH_UNKNOWN:-1, time:()=>Date.UTC(2026,8,9,18)/1000,F:v=>v,String,sizeof:()=>40,
+    server:{setContentLength:()=>{},sendContent:chunk=>{response.html=(response.html||'')+chunk;},sendHeader:(k,v)=>response.headers[k]=v,send:(code,type,html)=>Object.assign(response,{code,type,html})},
     localtime_r:(epoch,out)=>{const d=new Date(epoch*1000);Object.assign(out,{tm_year:d.getUTCFullYear()-1900,tm_mon:d.getUTCMonth(),tm_mday:d.getUTCDate(),tm_hour:d.getUTCHours(),tm_min:d.getUTCMinutes(),tm_sec:d.getUTCSeconds(),tm_wday:d.getUTCDay(),tm_yday:Math.floor((d-Date.UTC(d.getUTCFullYear(),0,1))/86400000)});return out;},
     mktime:t=>Date.UTC(t.tm_year+1900,t.tm_mon,t.tm_mday,t.tm_hour,t.tm_min,t.tm_sec)/1000,
     strftime:(out,size,format,t)=>{const pad=v=>String(v).padStart(2,'0');out.value=format==='%H:%M'?pad(t.tm_hour)+':'+pad(t.tm_min):format==='%H:%M:%S'?pad(t.tm_hour)+':'+pad(t.tm_min)+':'+pad(t.tm_sec):format==='%Y-%m-%d'?(t.tm_year+1900)+'-'+pad(t.tm_mon+1)+'-'+pad(t.tm_mday):'Wednesday, 09 September 2026';},...overrides};
   const funcs=compileFirmwareFunctions(source,['scheduleSlotToday','scheduleTimeRange','htmlEscape','handleScheduleHtml'],state,{replacements:[
-    [/HttpScope _scope;/g,''],[/struct tm start = today;/g,'let start = {...today};'],[/struct tm (today|end);/g,'let $1 = {};'],[/&(start|end|today|finish|now)\b/g,'$1'],
+    [/HttpHtmlBuffer html\(server\);/g,'let html = "";'],[/html.ready\(\)/g,'true'],[/html.flush\(\);/g,'server.sendContent(html); html = "";'],[/HttpScope _scope;/g,''],[/struct tm start = today;/g,'let start = {...today};'],[/struct tm (today|end);/g,'let $1 = {};'],[/&(start|end|today|finish|now)\b/g,'$1'],
     [/char (clock|date)\[\d+\];/g,'const $1 = {value:"",toString(){return this.value;}};'],[/String (html|out);/g,'let $1 = "";'],[/String result\(clock\);/g,'let result = String(clock);'],[/String name =/g,'let name ='],[/\b(html|out)\.reserve\([^;]+;/g,''],[/\bsize_t i/g,'let i'],[/\.length\(\)/g,'.length'],[/name.trim\(\);/g,'name = name.trim();']
   ]});
   funcs.handleScheduleHtml();return {response,funcs};
