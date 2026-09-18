@@ -1,25 +1,25 @@
 {
   "name": "ESP32 Irrigation Controller - ESP32 Dev Module",
-  "version": "3.2.4",
+  "version": "3.2.5",
   "new_install_prompt_erase": true,
   "builds": [
     {
       "chipFamily": "ESP32",
       "parts": [
         {
-          "path": "bootloader.bin?v=3.2.4-5fd2b151",
+          "path": "bootloader.bin?v=3.2.5-summary-left",
           "offset": 4096
         },
         {
-          "path": "partitions.bin?v=3.2.4-5fd2b151",
+          "path": "partitions.bin?v=3.2.5-summary-left",
           "offset": 32768
         },
         {
-          "path": "boot_app0.bin?v=3.2.4-5fd2b151",
+          "path": "boot_app0.bin?v=3.2.5-summary-left",
           "offset": 57344
         },
         {
-          "path": "firmware.bin?v=3.2.4-5fd2b151",
+          "path": "firmware.bin?v=3.2.5-summary-left",
           "offset": 65536
         }
       ]

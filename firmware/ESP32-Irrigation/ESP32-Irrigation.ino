@@ -57,7 +57,7 @@ extern "C" {
 // ---------- Hardware ----------
 static const char kFirmwareSignature[] __attribute__((used)) =
   "Original author: Beau Kaczmarek - https://github.com/numerik11/ESP32-Irrigation-Controller";
-static const char kFirmwareVersion[] = "3.2.4";
+static const char kFirmwareVersion[] = "3.2.5";
 static const char kFirmwareBuildDate[] = __DATE__ " " __TIME__;
 static const char kUpdateReportUrl[] =
   "https://irrigation-update-counter.beaukacz86.workers.dev/v1/report";
@@ -7320,6 +7320,7 @@ void handleRoot() {
   html += F(".action-card .toolbar{display:grid;grid-template-columns:repeat(auto-fit,minmax(118px,1fr));width:100%;gap:8px}.action-card .toolbar .btn{text-align:center}");
   html += F("@media(max-width:720px){.collapsible-section-head{align-items:stretch;padding:11px 12px}.collapsible-section-head .collapse-toggle{width:100%;justify-content:space-between}.sched-tools{width:100%}.sched-tools .collapse-toggle{flex:1 1 160px}.zone-row-status{justify-content:space-between}.action-grid{grid-template-columns:1fr}.action-card{min-height:0}}");
   html += F("@media(max-width:480px){.section-head h2{font-size:1.08rem}.section-summary{font-size:.78rem}.zone-row-actions{display:grid;grid-template-columns:1fr 1fr;width:100%}.zone-row-actions .btn{width:100%}.action-card .toolbar{grid-template-columns:1fr}.dash-nav a{min-width:auto}}");
+  html += F("#summary-section .collapsible-section-head{align-items:flex-start;justify-content:flex-start;text-align:left}#summary-section .section-head-copy{margin-left:0;margin-right:0}#summary-section .collapse-toggle{align-self:flex-start;width:auto;margin-left:0;margin-right:0}");
   // Keep the mobile utility bar focused on identity and the two controls people use.
   // Time, date, timezone, firmware and host remain visible on wider screens; the
   // dashboard card immediately below already presents the useful mobile context.
