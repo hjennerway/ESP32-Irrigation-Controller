@@ -218,7 +218,7 @@ replaced); subsequent application updates can use `/update`. ArduinoOTA remains
 available as a fallback when it works on the local network.
 
 
-## Today's schedule in a dashboard (Home Assistnt Setup)
+## Today's schedule in a dashboard (Home Assistant Setup)
 
 Open `http://espirrigation.local/schedule-html` (or use the controller's IP address) for a compact, read-only page that can be embedded in an iframe. It lists all zones scheduled on the controller's current local day, including earlier starts, using the saved zone names and both enabled start times. Empty names fall back to the zone number.
 
