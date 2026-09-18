@@ -289,36 +289,3 @@ Beau
 
 
 
-## Version 3.1.2
-
-Weather, soil-moisture, MQTT and update-report requests now run outside the control loop. Failed weather requests back off, Wi-Fi reconnection no longer waits eight seconds, and event logging uses cached weather. Both ESP32 and ESP32-S3 updater images include these fixes.
-
-## Version 3.1.3
-
-The Events page now streams HTML in small chunks to reduce memory pressure. It shows up to 64 recent run entries, newest first, and bounds individual log-line reads. Download CSV retains the complete event history. Both ESP32 and ESP32-S3 updater images include this fix.
-
-## Version 3.1.4
-
-Setup uses smaller HTML chunks and the current in-memory settings. Saving no longer waits for NTP or forces sensor reads; timezone synchronisation restarts only when its settings change. Status polling shares requests, times out stalled requests, and pauses during navigation. Saves that require a restart show a confirmation page before reopening Setup.
-
-The main loop checks valve expiry and watering restrictions before HTTP work and again around background work. Valve transitions request a screen redraw instead of pausing for OLED messages. The loop refreshes its timestamp after web requests and yields for 5 ms between passes.
-
-## Version 3.2
-
-The Current Weather summary shows Forecasted Rain between Condition and Wind Direction. It displays the next 24 hours of predicted rainfall in millimetres, updates with live status, and shows -- until a forecast is available.
-
-## Version 3.2.1
-
-Home streams its complete response, including JavaScript and zone cards, through a fixed 2 KB buffer. This removes the large contiguous allocations that could leave the page incomplete on an ESP32. Live status requests no longer overlap, have an eight-second timeout, and pause during navigation or while the tab is hidden.
-
-## Version 3.2.2
-
-The weather summary replaces Sunrise and Sunset with Day Length and Daily Change compared with yesterday. Daylight comes from Open-Meteo daily daylight duration; yesterday is included in daily data while the hourly rain forecast stays at 24 future entries. Daily temperature and solar values are selected by date. Missing or stale daylight data is shown as --.
-
-## Version 3.2.3
-
-Setup, Events, Diagnostics, firmware upload, schedule and tank calibration pages now stream through a fixed 2 KB buffer, including individual event rows. Weather no longer preallocates 20 KB of raw JSON storage or retains a raw forecast cache. Completed worker payloads are released after their results are applied. These changes reduce memory pressure on classic ESP32 boards without PSRAM. Both updater images include the fix; flash partition layouts are unchanged.
-
-## Version 3.2.4
-
-The 240x320 portrait TFT home screen now uses a larger clock and next-watering time, shows the next zone name with a countdown refreshed every minute, and spreads tank status, water source and soil readings across the available width. Long zone names are shortened to fit. Both ESP32 and ESP32-S3 updater images include the layout update.
