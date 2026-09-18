@@ -97,6 +97,34 @@ Periods use controller local time, include the start, and exclude the end. Equal
 
 An optional level sensor can help select between a rainwater tank and mains supply. Available modes include **Auto: Tank**, **Auto: Mains**, **Force Tank**, and **Force Mains**.
 
+## Today's schedule in a dashboard (Home Assistant Setup)
+
+Open `http://espirrigation.local/schedule-html` (or use the controller's IP address) for a compact, read-only page that can be embedded in an iframe. It lists all zones scheduled on the controller's current local day, including earlier starts, using the saved zone names and both enabled start times. Empty names fall back to the zone number.
+
+Each zone shows up to two enabled start/end ranges in chronological order, for example `11:30 - 12:00` and `17:30 - 18:00`. Enable the second start in the zone's schedule to show both runs. The compact page omits the explanatory footer.
+
+For custom styling, open **Setup → Schedule HTML Styles** and enter CSS in the Custom CSS box. The saved rules are added after the built-in styles in the `/schedule-html` page header, so they can override the defaults. The page exposes `.schedule-page`, `.schedule-content`, `.schedule-heading`, `.schedule-date`, `.schedule-table`, `.schedule-columns`, `.schedule-zone`, `.schedule-zone-name`, `.schedule-times`, `.schedule-time`, and `.schedule-status`. CSS in a parent dashboard does not cross into an iframe.
+
+The page refreshes every 60 seconds and follows the browser's light/dark preference. End times use current Smart Watering durations, with zero-duration adjustments marked as skipped. Times are estimates rather than run history: rain, wind, pauses and other delays can change actual watering. An end after midnight includes its date. An unsynchronized controller shows a waiting message.
+
+For a Home Assistant [Webpage card](https://www.home-assistant.io/dashboards/iframe/):
+
+```yaml
+type: iframe
+url: http://espirrigation.local/schedule-html
+aspect_ratio: 60%
+```
+
+For another dashboard:
+
+```html
+<iframe src="http://espirrigation.local/schedule-html"
+        title="Today's irrigation schedule"
+        style="width:100%;height:360px;border:0"></iframe>
+```
+
+The browser viewing the dashboard must be able to reach the controller. For an HTTPS dashboard, serve the controller page through an HTTPS reverse proxy; browsers block an HTTP iframe inside an HTTPS page. Keep Home Assistant's default iframe sandbox enabled.
+
 ## 🔌 Wiring
 
 ### Controller wiring diagram
@@ -217,34 +245,6 @@ image once over USB/Web Serial (erasing the device so the partition table is
 replaced); subsequent application updates can use `/update`. ArduinoOTA remains
 available as a fallback when it works on the local network.
 
-
-## Today's schedule in a dashboard (Home Assistant Setup)
-
-Open `http://espirrigation.local/schedule-html` (or use the controller's IP address) for a compact, read-only page that can be embedded in an iframe. It lists all zones scheduled on the controller's current local day, including earlier starts, using the saved zone names and both enabled start times. Empty names fall back to the zone number.
-
-Each zone shows up to two enabled start/end ranges in chronological order, for example `11:30 - 12:00` and `17:30 - 18:00`. Enable the second start in the zone's schedule to show both runs. The compact page omits the explanatory footer.
-
-For custom styling, open **Setup → Schedule HTML Styles** and enter CSS in the Custom CSS box. The saved rules are added after the built-in styles in the `/schedule-html` page header, so they can override the defaults. The page exposes `.schedule-page`, `.schedule-content`, `.schedule-heading`, `.schedule-date`, `.schedule-table`, `.schedule-columns`, `.schedule-zone`, `.schedule-zone-name`, `.schedule-times`, `.schedule-time`, and `.schedule-status`. CSS in a parent dashboard does not cross into an iframe.
-
-The page refreshes every 60 seconds and follows the browser's light/dark preference. End times use current Smart Watering durations, with zero-duration adjustments marked as skipped. Times are estimates rather than run history: rain, wind, pauses and other delays can change actual watering. An end after midnight includes its date. An unsynchronized controller shows a waiting message.
-
-For a Home Assistant [Webpage card](https://www.home-assistant.io/dashboards/iframe/):
-
-```yaml
-type: iframe
-url: http://espirrigation.local/schedule-html
-aspect_ratio: 60%
-```
-
-For another dashboard:
-
-```html
-<iframe src="http://espirrigation.local/schedule-html"
-        title="Today's irrigation schedule"
-        style="width:100%;height:360px;border:0"></iframe>
-```
-
-The browser viewing the dashboard must be able to reach the controller. For an HTTPS dashboard, serve the controller page through an HTTPS reverse proxy; browsers block an HTTP iframe inside an HTTPS page. Keep Home Assistant's default iframe sandbox enabled.
 
 ### Faster OTA build verification on Windows
 
